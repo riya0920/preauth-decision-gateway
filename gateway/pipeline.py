@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 
 from .budget import Budget
+from .features import FeatureCache, assemble
 from .velocity import SafeCounter
 
 # amount ceiling (minor units) -> behaviour when the model is unavailable
@@ -160,6 +161,7 @@ class Gateway:
         self.audit = audit
         self.breaker = CircuitBreaker()
         self.feature_cache_up = True
+        self.feature_cache: FeatureCache | None = None
         self.source_counts: dict[str, int] = {}
 
     def decide(self, req: Request) -> Decision:
@@ -198,13 +200,29 @@ class Gateway:
 
         # -- 4. feature assembly ---------------------------------------------
         t = time.perf_counter()
-        if self.feature_cache_up:
+        discount = 0.0
+        features_usable = True
+        if self.feature_cache is not None:
+            _simulate_io_ms(1.5)
+            bundle = assemble(self.feature_cache, req.card_id)
+            reasons.extend(bundle.reasons())
+            discount = bundle.confidence_discount()
+            features_usable = bundle.usable_for_model
+            features_complete = bundle.complete
+        elif self.feature_cache_up:
             _simulate_io_ms(1.5)
             features_complete = True
         else:
             features_complete = False
             reasons.append("features_partial")
         self.budget.record("features", _ms_since(t))
+
+        if not features_usable:
+            # A missing HARD feature means the model would score on a lie.
+            # Rules-only is the honest fallback, not a degraded model call.
+            decision, source = self._degrade(req, velocity_available, v_card)
+            return self._finish(req, decision, source + "_no_features", None,
+                                reasons, t_start)
 
         # -- 5. model score, behind a breaker --------------------------------
         t = time.perf_counter()
@@ -225,8 +243,13 @@ class Gateway:
             return self._finish(req, decision, source, None, reasons, t_start)
 
         # -- 6. decision policy ----------------------------------------------
-        threshold = 0.75 if features_complete else 0.60   # partial-feature discount
-        if not features_complete:
+        # Stale SOFT features do not block scoring; they tighten the threshold,
+        # because a score built on older inputs deserves less benefit of the doubt.
+        threshold = 0.75 - discount
+        if discount:
+            reasons.append("confidence_discounted:{:.2f}".format(discount))
+        elif not features_complete:
+            threshold = 0.60
             reasons.append("confidence_discounted")
         decision = "decline" if score >= threshold else "approve"
         if 0.60 <= score < threshold:

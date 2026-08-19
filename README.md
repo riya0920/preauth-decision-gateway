@@ -1,12 +1,15 @@
 # SE-3 — Low-Latency Pre-Auth Decision Gateway
 
-**Status: ~20% slice.** The latency budget, race-free velocity counters, the
-tiered degradation policy, and the chaos drills are built. There is no HTTP
-service, no Redis, no separate model process, and no metrics export.
+**Status: ~50%.** The latency budget, race-free velocity counters, the tiered
+degradation policy, chaos drills, an HTTP service, per-feature freshness policy
+and Prometheus metrics are built (18 tests). There is still no Redis and no
+separate model process.
 
 ```bash
-python run_load.py
-python -m pytest tests -q
+python run_load.py            # budget table + 4 chaos drills
+python -m pytest tests -q     # 18 tests
+uvicorn serve:app --port 8080
+curl -s localhost:8080/metrics
 ```
 
 ## The latency budget, measured against allocation
@@ -92,23 +95,65 @@ stage cost. A model call is I/O, so it now sleeps and releases the GIL; velocity
 reads 0.04ms. Any load harness where the fake dependency burns CPU is measuring
 the harness.
 
-## What is NOT built (the other 80%)
+## Stale-feature policy (`gateway/features.py`)
 
-1. **No service.** No FastAPI/gRPC, no HTTP contract, no OpenAPI, no containers.
-   `Gateway.decide()` is a method call, so every latency number excludes
-   serialisation and network entirely.
-2. **No Redis.** Velocity counters and the feature cache are in-process dicts.
+The question a global TTL cannot answer: a cached feature is 90 seconds old and
+its TTL is 60. Do you use it?
+
+"No" converts a cache miss into a model that cannot score. "Yes" uses a velocity
+counter that cannot see the attack that started 90 seconds ago. So freshness is
+**per feature**, and each policy carries its reason:
+
+| feature | freshness | TTL | why |
+|---|---|---|---|
+| `velocity_24h` | HARD | 30s | cannot see an in-progress attack when stale |
+| `device_history` | SOFT | 300s | changes slowly; stale is still informative |
+| `card_tenure_days` | SOFT | 3600s | changes once a day at most |
+| `merchant_risk` | STATIC | — | reference data, versioned not cached |
+
+A stale SOFT feature still scores, at a **tightened threshold** (0.75 − 0.05 per
+stale feature). A stale HARD feature is treated as **missing** and the request
+falls back to rules — scoring on a two-minute-old velocity counter is worse than
+knowing you do not have it. Chaos drill 3 exercises all three states live:
+
+```
+fresh features               model 100.0%
+stale SOFT feature (tenure)  model  99.5%   <- still scores, discounted
+stale HARD feature (velocity) degraded_*_no_features 98.4%
+feature cache DOWN            degraded_*_no_features 94.0%
+```
+
+## Metrics (`/metrics`, `gateway/metrics.py`)
+
+Prometheus text format, hand-written rather than pulled from `prometheus_client`
+because the exposition format is twelve lines and the dependency would obscure
+the point: **histograms, not averages.** 99 requests at 5ms and one at 2000ms
+average under 25ms and blow a 100ms p99 SLO — a mean hides the tail by
+construction. Bucket boundaries cluster around the budget (5–100ms) rather than
+being log-spaced by habit, so the quantile estimate is precise where the SLO
+lives. Per-stage histograms are exported alongside the end-to-end one, because an
+SLO breach that does not say which stage moved is an alert nobody can act on.
+
+## What is NOT built
+
+1. **No Redis.** Velocity counters and the feature cache are in-process dicts.
    The Lua/`MULTI-EXEC` atomicity argument is made in comments, not code, and the
-   network round trip is missing from the budget.
-3. **No separate model service**, therefore no gRPC-vs-HTTP comparison — the spec
-   asks to measure both and keep the winner, and that isn't done.
-4. **No metrics export** — no Prometheus histograms, no Grafana, no dashboard.
-   The budget table is printed by the load script.
-5. **No soak test.** 30-minute sustained-load drift/leak detection is absent;
-   runs here are seconds long.
-6. **Feature-cache-down path is implemented but not chaos-tested** in `run_load.py`
-   (`feature_cache_up` is never flipped), so the confidence-discount branch has
-   no drill behind it.
-7. **No stale-feature policy** — TTLs are not modelled at all.
-8. Real load-generation (multi-process, open-loop arrival, target RPS) rather
-   than a closed-loop thread pool.
+   network round trip is therefore missing from every budget line.
+2. **No separate model service**, so no gRPC-vs-HTTP comparison — the spec asks
+   to measure both and keep the winner, and that is not done. The "model service"
+   is an in-process object that sleeps.
+3. **No soak test.** 30-minute sustained-load drift/leak detection is absent;
+   runs here are seconds long, so nothing here would catch a slow leak.
+4. **No containers, no CI, no Grafana.** `/metrics` emits the right format but
+   nothing scrapes it and no dashboard or alert rule exists.
+5. **Closed-loop load generation.** `run_load.py` is a thread pool that sends the
+   next request when the last returns, which cannot produce a target RPS or
+   simulate a queue building — open-loop generation is the correct tool and is
+   not used.
+6. **The velocity-store-down posture is still uncomfortable and unresolved.**
+   With no counter we cannot see a carding attack, and burst traffic is exactly
+   the pattern that needs it. The current choice (fail open under $50) is made in
+   the dark and should be revisited with a fraud team rather than defended.
+7. **Audit log durability.** Async buffering is proven off the hot path, but a
+   crash between buffer write and drain loses those records. The local-WAL answer
+   is described in the drill output and not implemented.

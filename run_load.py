@@ -127,6 +127,52 @@ def main() -> int:
     print("  in the dark -- it should be revisited with the fraud team, not defended")
     print("  as obviously right.")
 
+    # ---- chaos drill 3: feature cache stale / down ------------------------
+    print("\n" + "=" * 84)
+    print("CHAOS DRILL 3: FEATURE CACHE -- STALE, THEN DOWN")
+    print("=" * 84)
+    model.up = True
+    velocity.available = True
+    time.sleep(2.1)
+
+    from gateway.features import FEATURE_POLICY, FeatureCache, assemble
+    cache = FeatureCache()
+    gw.feature_cache = cache
+
+    # Populate every card with FRESH features first.
+    rng = random.Random(7)
+    cards = ["CARD_{:05d}".format(i) for i in range(4000)]
+    for c in cards:
+        cache.put(c, "velocity_24h", rng.random() * 5)
+        cache.put(c, "card_tenure_days", rng.random() * 2000)
+        cache.put(c, "device_history", rng.random())
+    _, _ = run_phase(gw, "fresh features", 100)
+
+    # Now age the SOFT feature past its TTL: usable, with a discount.
+    for c in cards:
+        cache.put(c, "card_tenure_days", rng.random() * 2000, age_s=7200)
+    _, _ = run_phase(gw, "stale SOFT feature (tenure)", 100)
+
+    # Age the HARD feature: treated as missing, model must not be trusted.
+    for c in cards:
+        cache.put(c, "velocity_24h", rng.random() * 5, age_s=600)
+    _, _ = run_phase(gw, "stale HARD feature (velocity)", 100)
+
+    print("\n  Freshness is a PER-FEATURE policy, not a global TTL:")
+    for name, pol in FEATURE_POLICY.items():
+        print("    {:<18} {:<7} ttl {:>5}s  -- {}".format(
+            name, pol["freshness"], pol["ttl_s"], pol["why"]))
+    print("\n  A stale SOFT feature still scores, at a tightened threshold. A stale")
+    print("  HARD feature is treated as MISSING and the request falls back to")
+    print("  rules -- a velocity counter two minutes old cannot see an attack that")
+    print("  started ninety seconds ago, and scoring on it is worse than knowing")
+    print("  you do not have it.")
+
+    cache.available = False
+    _, _ = run_phase(gw, "feature cache DOWN", 100)
+    cache.available = True
+    gw.feature_cache = None
+
     # ---- recovery ----------------------------------------------------------
     print("\n" + "=" * 84)
     print("RECOVERY")
