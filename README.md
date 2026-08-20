@@ -1,13 +1,15 @@
 # SE-3 — Low-Latency Pre-Auth Decision Gateway
 
-**Status: ~50%.** The latency budget, race-free velocity counters, the tiered
-degradation policy, chaos drills, an HTTP service, per-feature freshness policy
-and Prometheus metrics are built (18 tests). There is still no Redis and no
-separate model process.
+**Status: ~70%.** Latency budget, race-free velocity counters (in-process **and
+on Redis with an atomic Lua script**), tiered degradation, chaos drills, HTTP
+service, per-feature freshness policy, Prometheus metrics, and an **open-loop**
+load generator with a soak -- **25 tests**. There is still no separate model
+process and no real Redis server in the loop.
 
 ```bash
 python run_load.py            # budget table + 4 chaos drills
-python -m pytest tests -q     # 18 tests
+python run_soak.py            # open-loop load curve + soak
+python -m pytest tests -q     # 25 tests
 uvicorn serve:app --port 8080
 curl -s localhost:8080/metrics
 ```
@@ -136,20 +138,31 @@ SLO breach that does not say which stage moved is an alert nobody can act on.
 
 ## What is NOT built
 
-1. **No Redis.** Velocity counters and the feature cache are in-process dicts.
-   The Lua/`MULTI-EXEC` atomicity argument is made in comments, not code, and the
-   network round trip is therefore missing from every budget line.
+1. **No Redis SERVER.** `gateway/redis_velocity.py` is a real implementation --
+   sliding-window counters in a sorted set, the whole trim-add-count sequence in
+   one atomic Lua script, TTL so idle keys do not leak -- and the tests execute
+   that Lua under fakeredis, so the atomicity is exercised rather than asserted.
+   What fakeredis cannot exercise is a real network round trip, cross-node
+   behaviour, failover, or a partition. The gateway's hot path also still uses
+   the in-process counter; swapping it is a constructor change, not a rewrite.
 2. **No separate model service**, so no gRPC-vs-HTTP comparison — the spec asks
    to measure both and keep the winner, and that is not done. The "model service"
    is an in-process object that sleeps.
-3. **No soak test.** 30-minute sustained-load drift/leak detection is absent;
-   runs here are seconds long, so nothing here would catch a slow leak.
-4. **No containers, no CI, no Grafana.** `/metrics` emits the right format but
-   nothing scrapes it and no dashboard or alert rule exists.
-5. **Closed-loop load generation.** `run_load.py` is a thread pool that sends the
-   next request when the last returns, which cannot produce a target RPS or
-   simulate a queue building — open-loop generation is the correct tool and is
-   not used.
+3. **A 30-minute soak.** `run_soak.py` implements it and defaults to a
+   CI-sized 20s; `--soak-seconds 1800` is the spec's number and has not been run
+   long enough to prove the absence of a leak. What the short soak DOES show is
+   two real growth curves -- unevicted velocity keys and an undrained audit
+   buffer -- both described in its output.
+4. **No containers and no Grafana.** CI runs the tests and the chaos drills on
+   every push, but `/metrics` is scraped by nothing and no dashboard or alert
+   rule exists.
+5. **A load curve that says anything about a REAL gateway.** `run_soak.py` is a
+   proper open-loop generator -- Poisson arrivals dispatched on a schedule, a
+   pre-spawned worker pool, latency clocked from enqueue so queueing delay
+   counts -- and `offered` tracks `target` exactly, so the harness is not the
+   bottleneck. But it finds no knee up to 800 RPS, and that is a fact about the
+   *stub*: a sleeping model releases the GIL, so nothing ever contends. A real
+   knee needs the real dependencies in items 1 and 2.
 6. **The velocity-store-down posture is still uncomfortable and unresolved.**
    With no counter we cannot see a carding attack, and burst traffic is exactly
    the pattern that needs it. The current choice (fail open under $50) is made in
