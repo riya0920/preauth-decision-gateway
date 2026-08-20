@@ -1,15 +1,16 @@
 # SE-3 — Low-Latency Pre-Auth Decision Gateway
 
-**Status: ~70%.** Latency budget, race-free velocity counters (in-process **and
+**Status: ~85%.** Latency budget, race-free velocity counters (in-process **and
 on Redis with an atomic Lua script**), tiered degradation, chaos drills, HTTP
-service, per-feature freshness policy, Prometheus metrics, and an **open-loop**
-load generator with a soak -- **25 tests**. There is still no separate model
-process and no real Redis server in the loop.
+service, per-feature freshness policy, Prometheus metrics, an open-loop load
+generator with a soak, and a **separate model process** serving two transports
+with real CPU contention -- **31 tests**.
 
 ```bash
 python run_load.py            # budget table + 4 chaos drills
 python run_soak.py            # open-loop load curve + soak
-python -m pytest tests -q     # 25 tests
+python run_transports.py      # HTTP vs binary framing, separate model process
+python -m pytest tests -q     # 31 tests
 uvicorn serve:app --port 8080
 curl -s localhost:8080/metrics
 ```
@@ -145,14 +146,23 @@ SLO breach that does not say which stage moved is an alert nobody can act on.
    What fakeredis cannot exercise is a real network round trip, cross-node
    behaviour, failover, or a partition. The gateway's hot path also still uses
    the in-process counter; swapping it is a constructor change, not a rewrite.
-2. **No separate model service**, so no gRPC-vs-HTTP comparison — the spec asks
-   to measure both and keep the winner, and that is not done. The "model service"
-   is an in-process object that sleeps.
-3. **A 30-minute soak.** `run_soak.py` implements it and defaults to a
-   CI-sized 20s; `--soak-seconds 1800` is the spec's number and has not been run
-   long enough to prove the absence of a leak. What the short soak DOES show is
-   two real growth curves -- unevicted velocity keys and an undrained audit
-   buffer -- both described in its output.
+2. **gRPC itself.** `run_transports.py` runs a genuinely separate model PROCESS
+   that burns real CPU, and compares pooled keep-alive HTTP against a
+   length-prefixed binary framing on loopback. That isolates framing cost --
+   binary is 2.07ms faster at p50, ~7% of the 30ms model budget -- but it is not
+   gRPC: no protobuf, no HTTP/2 multiplexing, no streaming. Calling it gRPC
+   would be the easy lie.
+
+   The comparison also argues against my own transport, which is why it is worth
+   running: at 32 concurrent callers the binary path timed out 95 times against
+   HTTP's 14. It wins the microbenchmark and loses the failure mode, because
+   `ThreadingHTTPServer` has had decades of backlog and connection handling
+   beaten into it and a hand-rolled socket loop has not. That, not the 2ms, is
+   the actual argument for gRPC.
+3. **A 30-minute soak actually run.** `run_soak.py` implements it and defaults
+   to a CI-sized 20s; `--soak-seconds 1800` is the spec's number and has not been
+   run long enough to prove the absence of a leak. The short soak does show two
+   real growth curves — unevicted velocity keys and an undrained audit buffer.
 4. **No containers and no Grafana.** CI runs the tests and the chaos drills on
    every push, but `/metrics` is scraped by nothing and no dashboard or alert
    rule exists.
