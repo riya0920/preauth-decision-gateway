@@ -1,0 +1,29 @@
+# UNBUILT -- see the note at the top of the Dockerfile.
+#
+# The gateway and the model are SEPARATE services on purpose: run_transports.py
+# measures the cost of that boundary (about 2ms of framing at p50, and real CPU
+# contention under load), and collapsing them into one container would delete
+# the thing being measured.
+services:
+  model:
+    build: .
+    command: ["python", "model_server.py", "--http-port", "8711",
+              "--binary-port", "8712", "--cpu-ms", "8"]
+    expose: ["8711", "8712"]
+
+  gateway:
+    build: .
+    depends_on: [model]
+    environment:
+      MODEL_HTTP_URL: "http://model:8711"
+    ports: ["8080:8080"]
+    command: ["uvicorn", "serve:app", "--host", "0.0.0.0", "--port", "8080"]
+
+  # A REAL Redis, which is the one thing fakeredis cannot be. The Lua script in
+  # gateway/redis_velocity.py runs unchanged against it; what changes is that
+  # the network hop, eviction under memory pressure and failover become real.
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "256mb",
+              "--maxmemory-policy", "allkeys-lru"]
+    expose: ["6379"]

@@ -1,10 +1,11 @@
 # SE-3 — Low-Latency Pre-Auth Decision Gateway
 
-**Status: ~85%.** Latency budget, race-free velocity counters (in-process **and
-on Redis with an atomic Lua script**), tiered degradation, chaos drills, HTTP
-service, per-feature freshness policy, Prometheus metrics, an open-loop load
-generator with a soak, and a **separate model process** serving two transports
-with real CPU contention -- **31 tests**.
+**Status: ~95%.** Latency budget, race-free velocity counters (in-process
+**and on Redis with an atomic Lua script**), tiered degradation, chaos drills,
+HTTP service, per-feature freshness policy, Prometheus metrics, an open-loop
+load generator with a soak, a **separate model process** serving two transports
+with real CPU contention, and **ML-1's actual trained model wired in** --
+**31 tests**.
 
 ```bash
 python run_load.py            # budget table + 4 chaos drills

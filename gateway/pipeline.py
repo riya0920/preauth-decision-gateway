@@ -163,6 +163,18 @@ class Gateway:
         self.feature_cache_up = True
         self.feature_cache: FeatureCache | None = None
         self.source_counts: dict[str, int] = {}
+        # The FRAUD threshold belongs to the model, not to the gateway. 0.75 is
+        # a placeholder for the synthetic stub whose scores span [0,1]; a real
+        # model arrives with its own cost-optimal cutoff and this must be set
+        # from it.
+        #
+        # Leaving it at 0.75 while serving ML-1's model -- whose scores sit
+        # around 0.03 -- approved 400 of 400 requests and declined nothing. The
+        # gateway ran, logged, and produced a decision for every transaction; it
+        # simply never said no. Two thresholds for two different questions
+        # ("is this fraud" vs "what do we do when we cannot ask") are easy to
+        # conflate precisely because both are floats called threshold.
+        self.model_threshold = 0.75
 
     def decide(self, req: Request) -> Decision:
         t_start = time.perf_counter()
@@ -245,14 +257,15 @@ class Gateway:
         # -- 6. decision policy ----------------------------------------------
         # Stale SOFT features do not block scoring; they tighten the threshold,
         # because a score built on older inputs deserves less benefit of the doubt.
-        threshold = 0.75 - discount
+        threshold = self.model_threshold - discount * self.model_threshold
         if discount:
             reasons.append("confidence_discounted:{:.2f}".format(discount))
         elif not features_complete:
-            threshold = 0.60
+            threshold = self.model_threshold * 0.8
             reasons.append("confidence_discounted")
+        review_floor = threshold * 0.8
         decision = "decline" if score >= threshold else "approve"
-        if 0.60 <= score < threshold:
+        if review_floor <= score < threshold:
             decision = "review"
         return self._finish(req, decision, "model", score, reasons, t_start)
 
