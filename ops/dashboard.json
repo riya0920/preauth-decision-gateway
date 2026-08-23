@@ -1,0 +1,162 @@
+{
+  "title": "Pre-auth decision gateway",
+  "uid": "preauth-gateway",
+  "description": "Panel ORDER is the argument. Request rate first, then the decision mix, then latency. A dashboard that opens on a latency graph teaches its readers that latency is the question, and during the incident this service is most likely to have -- the model dying -- latency IMPROVES. Nothing here has ever been rendered: there is no Grafana in this environment.",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "stage",
+        "type": "custom",
+        "query": "parse_validate,hot_rules,velocity,features,model,decide_log",
+        "current": { "text": "model", "value": "model" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "1. Request rate",
+      "description": "First panel on purpose. A gateway with no traffic and a gateway that is down look identical on every other panel here, and this is the only one that tells them apart.",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_decisions_total[1m]))",
+          "legendFormat": "decisions/sec"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "2. Approval rate vs the same time yesterday",
+      "description": "The graph to watch during a model outage. A 5-point move is either fraud getting through or good customers being declined, and both cost money immediately. Compared against YESTERDAY because approval rate has a daily shape; comparing it to an hour ago fires every morning.",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_decisions_total{decision=\"approve\"}[15m])) / sum(rate(gateway_decisions_total[15m]))",
+          "legendFormat": "today"
+        },
+        {
+          "expr": "sum(rate(gateway_decisions_total{decision=\"approve\"}[15m] offset 1d)) / sum(rate(gateway_decisions_total[15m] offset 1d))",
+          "legendFormat": "yesterday"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "3. Decision source mix",
+      "description": "model / degraded_fail_open / degraded_rules_only / degraded_fail_closed. When this shifts away from `model`, panel 2 is the one that says whether it matters.",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum by (source) (rate(gateway_decisions_total[1m]))",
+          "legendFormat": "{{source}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "4. End-to-end latency percentiles",
+      "description": "HISTOGRAM QUANTILES, NOT AVERAGES. 99 requests at 5ms and one at 2000ms average under 25ms and blow a 100ms p99 SLO -- a mean hides the tail by construction. Bucket boundaries cluster around the budget (5-100ms) rather than being log-spaced by habit, so the estimate is precise where the SLO lives.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_decision_latency_ms_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_decision_latency_ms_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_decision_latency_ms_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 100 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "5. Per-stage p99 against allocation",
+      "description": "An SLO breach that does not say which stage moved is an alert nobody can act on. There is deliberately no headroom line: reserving headroom inside a p99 budget hides which stage is eating it. The headroom IS the gap between the p99 you promise and the p99 you measure.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_stage_latency_ms_model_bucket[5m])))",
+          "legendFormat": "model (budget 30ms)"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_stage_latency_ms_velocity_bucket[5m])))",
+          "legendFormat": "velocity (budget 20ms)"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_stage_latency_ms_features_bucket[5m])))",
+          "legendFormat": "features (budget 20ms)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "6. Audit buffer depth and unshipped WAL",
+      "description": "Gauges, not counters: a buffer that drains has a counter that keeps climbing and says nothing about the current depth, which is the only number an operator can act on. The 1800s soak grew this to 180,053 records with nothing draining it.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "gateway_audit_buffer_size", "legendFormat": "buffered (memory)" },
+        { "expr": "gateway_audit_wal_unshipped", "legendFormat": "on disk, unshipped" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "7. Velocity store errors",
+      "description": "This one pages, and it is a harder call than the model being down: with no counter the gateway cannot see a carding attack, and burst traffic is exactly the pattern that needs it.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        { "expr": "sum(increase(gateway_velocity_errors_total[15m]))", "legendFormat": "errors/15m" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

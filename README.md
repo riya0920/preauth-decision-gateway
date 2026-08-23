@@ -1,17 +1,21 @@
 # SE-3 — Low-Latency Pre-Auth Decision Gateway
 
-**Status: ~95%.** Latency budget, race-free velocity counters (in-process
+**Status: ~97%.** Latency budget, race-free velocity counters (in-process
 **and on Redis with an atomic Lua script**), tiered degradation, chaos drills,
-HTTP service, per-feature freshness policy, Prometheus metrics, an open-loop
-load generator with a soak, a **separate model process** serving two transports
-with real CPU contention, and **ML-1's actual trained model wired in** --
-**31 tests**.
+HTTP service, per-feature freshness policy, Prometheus metrics **including
+gauges**, an open-loop load generator, the **spec's full 30-minute soak actually
+run**, a **separate model process** serving two transports with real CPU
+contention, **ML-1's actual trained model wired in**, a **durable audit WAL in
+the service path**, and **alert rules and a dashboard that cannot drift away
+from the exporter** -- **53 tests**.
 
 ```bash
 python run_load.py            # budget table + 4 chaos drills
 python run_soak.py            # open-loop load curve + soak
 python run_transports.py      # HTTP vs binary framing, separate model process
-python -m pytest tests -q     # 31 tests
+python run_soak.py --soak-seconds 1800   # the spec's 30-minute soak
+python run_wal.py             # audit durability: fsync cost, and the crash
+python -m pytest tests -q     # 53 tests
 uvicorn serve:app --port 8080
 curl -s localhost:8080/metrics
 ```
@@ -138,46 +142,141 @@ being log-spaced by habit, so the quantile estimate is precise where the SLO
 lives. Per-stage histograms are exported alongside the end-to-end one, because an
 SLO breach that does not say which stage moved is an alert nobody can act on.
 
+## The 30-minute soak, actually run
+
+`python run_soak.py --soak-seconds 1800` — 180,053 requests over four segments:
+
+```
+   segment  requests       p50       p99
+         1    44,670       2.2      26.8
+         2    45,170       0.2      16.8
+         3    44,998       0.2      13.7
+         4    45,215       0.2      16.9
+p99 drift first -> last segment : -37.1%
+velocity keys  before -> after  : 0 -> 4,001
+audit buffer   before -> after  : 0 -> 180,053  (never drained)
+```
+
+**Established:** p99 did not degrade — it drifted **down** 37%, which is warm-up
+amortising over more samples rather than good news. And two growth curves are
+real and unbounded: velocity keys (the in-process store trims *within* a window
+and never evicts the key; the Redis version sets a TTL) and the audit buffer.
+
+**Not proven:** the absence of a leak. Thirty minutes bounds the leak *rate*; it
+does not bound the leak. A daily deploy cycle needs a soak measured in days, and
+nothing here has run for one.
+
+## Audit durability: the WAL
+
+The drill established that async audit logging is nearly free on the hot path —
+p99 32.12ms with the sink dead against 33.63ms steady. It also established, *in
+words while the code did nothing about it*, what that buffering costs: a crash
+between the buffer write and the drain loses those records.
+
+`gateway/wal.py` appends each decision to a **local** log before handing it to
+the async buffer. Local rather than remote, because a remote write puts a network
+round trip and another service's availability inside the p99. Measured over 4,000
+appends:
+
+| fsync | mean | p99 | fsyncs |
+|---|---|---|---|
+| never | 0.035 ms | 0.118 ms | 0 |
+| batch | 0.060 ms | 1.570 ms | 80 |
+| always | 1.720 ms | 4.148 ms | 4,000 |
+
+`never` and `batch` are genuinely free against a 100ms budget. **`always` is
+not** — 4.1% of the whole budget spent on one fsync per decision, on an idle
+laptop SSD with no competing write load. `never` survives a process crash,
+`always` survives a machine crash, `batch` bounds the loss to a configurable
+window, and that choice belongs to whoever owns the compliance requirement.
+
+The crash, simulated:
+
+| | plain AuditLog | with a WAL |
+|---|---|---|
+| decisions written | 4,500 | 4,500 |
+| in the buffer when it died | 500 | 500 |
+| recoverable after restart | 0 | **500** |
+| **permanently lost** | **500** | **0** |
+
+Those 500 are not a monitoring gap. Each is a decision the firm made about a
+customer's money with no record that it made it, and an adverse-action request
+against any of them has no answer.
+
+The WAL is **wired into `serve.py`**, not offered as a library. A durability
+mechanism that exists beside the thing making decisions protects nothing —
+"available" and "enforced" are different claims. What it does *not* do is replace
+shipping: a disk that dies takes it too. It bounds loss to what has not yet
+shipped.
+
+## Alert rules and a dashboard that cannot drift
+
+`ops/alerts.yml` (10 rules) and `ops/dashboard.json` (7 panels). **Nothing
+scrapes them** — there is no Prometheus and no Grafana here — which is exactly
+why they need a test. A rule naming a metric nobody emits never fires, and an
+alert that never fires looks identical to a system that is never unhealthy.
+
+`tests/test_alert_rules.py` drives the real service, reads its real `/metrics`,
+and asserts every metric named by every rule and every panel is actually
+exported. **It found the drift immediately:** the first draft used `preauth_*`
+names throughout and the exporter emits `gateway_*`. It also found three metrics
+the rules needed and nothing emitted — audit buffer depth, unshipped WAL depth,
+and velocity errors — which is why the registry now has **gauges** at all. A
+counter cannot express a buffer that drains: it keeps climbing and says nothing
+about the current depth, which is the only number an operator can act on.
+
+The rules encode one principle: **page on symptoms the customer feels, ticket on
+causes.** The model service being down is a *ticket* — the gateway degrades by
+design, and waking someone for a dependency the design already survives is how a
+rota stops reading its alerts. What *pages* is the approval rate moving 5 points
+against the same time yesterday, whatever the cause turns out to be.
+
+Two rules are worth calling out. `PreauthLatencyImprovedSuspiciously` fires
+because a graph got **better**: killing the model took p99 from 33.63ms to
+2.51ms, and a latency improvement with no deploy behind it means something
+stopped happening. `PreauthNoTraffic` exists because a gateway with no traffic
+and a gateway that is down look identical on every other panel — which is also
+why the dashboard's **first** panel is request rate rather than latency, and a
+test asserts that ordering.
+
 ## What is NOT built
 
-1. **No Redis SERVER.** `gateway/redis_velocity.py` is a real implementation --
+1. **No Redis SERVER.** `gateway/redis_velocity.py` is a real implementation —
    sliding-window counters in a sorted set, the whole trim-add-count sequence in
-   one atomic Lua script, TTL so idle keys do not leak -- and the tests execute
+   one atomic Lua script, TTL so idle keys do not leak — and the tests execute
    that Lua under fakeredis, so the atomicity is exercised rather than asserted.
    What fakeredis cannot exercise is a real network round trip, cross-node
    behaviour, failover, or a partition. The gateway's hot path also still uses
    the in-process counter; swapping it is a constructor change, not a rewrite.
 2. **gRPC itself.** `run_transports.py` runs a genuinely separate model PROCESS
    that burns real CPU, and compares pooled keep-alive HTTP against a
-   length-prefixed binary framing on loopback. That isolates framing cost --
-   binary is 2.07ms faster at p50, ~7% of the 30ms model budget -- but it is not
-   gRPC: no protobuf, no HTTP/2 multiplexing, no streaming. Calling it gRPC
-   would be the easy lie.
-
-   The comparison also argues against my own transport, which is why it is worth
-   running: at 32 concurrent callers the binary path timed out 95 times against
-   HTTP's 14. It wins the microbenchmark and loses the failure mode, because
-   `ThreadingHTTPServer` has had decades of backlog and connection handling
-   beaten into it and a hand-rolled socket loop has not. That, not the 2ms, is
-   the actual argument for gRPC.
-3. **A 30-minute soak actually run.** `run_soak.py` implements it and defaults
-   to a CI-sized 20s; `--soak-seconds 1800` is the spec's number and has not been
-   run long enough to prove the absence of a leak. The short soak does show two
-   real growth curves — unevicted velocity keys and an undrained audit buffer.
-4. **No containers and no Grafana.** CI runs the tests and the chaos drills on
-   every push, but `/metrics` is scraped by nothing and no dashboard or alert
-   rule exists.
-5. **A load curve that says anything about a REAL gateway.** `run_soak.py` is a
-   proper open-loop generator -- Poisson arrivals dispatched on a schedule, a
+   length-prefixed binary framing on loopback. That isolates framing cost —
+   binary is 2.07ms faster at p50 — but it is not gRPC: no protobuf, no HTTP/2
+   multiplexing, no streaming. The comparison also argues against my own
+   transport, which is why it is worth running: at 32 concurrent callers the
+   binary path timed out **95 times against HTTP's 14**. It wins the
+   microbenchmark and loses the failure mode, and *that* is the argument for
+   gRPC.
+3. **A Prometheus server, an Alertmanager, and Grafana.** The rules and the
+   dashboard are written and tested against the real exporter; none has ever
+   been loaded by the thing that would run it. They are reasoned artefacts, not
+   verified ones.
+4. **A load curve that says anything about a REAL gateway.** `run_soak.py` is a
+   proper open-loop generator — Poisson arrivals dispatched on a schedule, a
    pre-spawned worker pool, latency clocked from enqueue so queueing delay
-   counts -- and `offered` tracks `target` exactly, so the harness is not the
+   counts — and `offered` tracks `target` exactly, so the harness is not the
    bottleneck. But it finds no knee up to 800 RPS, and that is a fact about the
    *stub*: a sleeping model releases the GIL, so nothing ever contends. A real
    knee needs the real dependencies in items 1 and 2.
-6. **The velocity-store-down posture is still uncomfortable and unresolved.**
+5. **The velocity-store-down posture is still uncomfortable and unresolved.**
    With no counter we cannot see a carding attack, and burst traffic is exactly
    the pattern that needs it. The current choice (fail open under $50) is made in
-   the dark and should be revisited with a fraud team rather than defended.
-7. **Audit log durability.** Async buffering is proven off the hot path, but a
-   crash between buffer write and drain loses those records. The local-WAL answer
-   is described in the drill output and not implemented.
+   the dark and should be revisited with a fraud team rather than defended. There
+   is now an alert so somebody is awake to make the call in the light, which is
+   an improvement on nothing and is not an answer.
+6. **A multi-day soak.** Thirty minutes bounds the leak rate and does not bound
+   the leak, and the two growth curves it found are still growing.
+7. **WAL shipping and truncation.** `recover()` returns what a restart must
+   re-ship; nothing ships it, and nothing truncates the WAL once records are
+   acknowledged. Left running, it grows without bound — the mechanism is right
+   and the lifecycle around it is not built.

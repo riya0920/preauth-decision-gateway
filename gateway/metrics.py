@@ -73,11 +73,28 @@ class Counter:
         self.values[key] = self.values.get(key, 0) + by
 
 
+@dataclass
+class Gauge:
+    """A value that goes up AND down -- queue depth, buffer size, backlog.
+
+    Counters and histograms cannot express it. A buffer that grows to 180k and
+    is then drained has a counter that keeps climbing and says nothing about
+    the current depth, which is the only number an operator can act on.
+    """
+    name: str
+    help_text: str
+    value: float = 0.0
+
+    def set(self, value: float) -> None:
+        self.value = float(value)
+
+
 class Registry:
     def __init__(self):
         self._lock = threading.Lock()
         self.histograms: dict[str, Histogram] = {}
         self.counters: dict[str, Counter] = {}
+        self.gauges: dict[str, Gauge] = {}
 
     def histogram(self, name: str, help_text: str = "") -> Histogram:
         with self._lock:
@@ -90,6 +107,12 @@ class Registry:
             if name not in self.counters:
                 self.counters[name] = Counter(name, help_text)
             return self.counters[name]
+
+    def gauge(self, name: str, help_text: str = "") -> Gauge:
+        with self._lock:
+            if name not in self.gauges:
+                self.gauges[name] = Gauge(name, help_text)
+            return self.gauges[name]
 
     def render(self) -> str:
         """Prometheus text exposition format (version 0.0.4)."""
@@ -111,6 +134,10 @@ class Registry:
                     lines.append("{}{{{}}} {}".format(c.name, labels, v))
                 else:
                     lines.append("{} {}".format(c.name, v))
+        for g in self.gauges.values():
+            lines.append("# HELP {} {}".format(g.name, g.help_text))
+            lines.append("# TYPE {} gauge".format(g.name))
+            lines.append("{} {:g}".format(g.name, g.value))
         return "\n".join(lines) + "\n"
 
 

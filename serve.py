@@ -17,6 +17,7 @@ Run:  uvicorn serve:app --port 8080
 from __future__ import annotations
 
 import sys
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from gateway.budget import SLO_P99_MS, Budget
 from gateway.features import FeatureCache
 from gateway.metrics import REGISTRY
 from gateway.pipeline import AuditLog, Gateway, ModelService, Request
+from gateway.wal import AuditWal, DurableAuditLog
 from gateway.velocity import SafeCounter
 
 _state: dict = {}
@@ -38,10 +40,22 @@ _state: dict = {}
 @asynccontextmanager
 async def lifespan(_app):
     budget = Budget()
-    gw = Gateway(ModelService(), SafeCounter(), budget, AuditLog())
+    # The WAL is IN the service path, not beside it. A durability mechanism that
+    # exists as a library and is not wired into the thing that makes decisions
+    # protects nothing -- and "available" and "enforced" are different claims.
+    #
+    # fsync=batch by default: bounded loss at a bounded cost. `always` measured
+    # 1.72ms mean / 4.15ms p99 per append, which is 4.1% of the 100ms budget
+    # spent on one fsync per decision, and that choice belongs to whoever owns
+    # the compliance requirement rather than to this line.
+    wal = AuditWal(Path(os.environ.get("GATEWAY_WAL", "data/audit.wal.jsonl")),
+                   fsync=os.environ.get("GATEWAY_WAL_FSYNC", "batch"))
+    audit = DurableAuditLog(wal)
+    gw = Gateway(ModelService(), SafeCounter(), budget, audit)
     gw.feature_cache = FeatureCache()
-    _state.update({"gw": gw, "budget": budget})
+    _state.update({"gw": gw, "budget": budget, "wal": wal})
     yield
+    wal.close()
     _state.clear()
 
 
@@ -92,6 +106,25 @@ def authorize(req: AuthRequest) -> AuthResponse:
         "gateway_decisions_total",
         "Decisions by outcome and source").inc(
             {"decision": decision.decision, "source": decision.source})
+
+    # Gauges, because these go DOWN as well as up and the current depth is the
+    # only number an operator can act on. `ops/alerts.yml` alerts on both, and
+    # `test_alert_rules.py` asserts every metric those rules name is actually
+    # exported here -- an alert rule referring to a metric nobody emits is
+    # silently never going to fire, which is the worst kind of alert to own.
+    REGISTRY.gauge(
+        "gateway_audit_buffer_size",
+        "Audit records buffered and not yet shipped").set(len(gw.audit.buffer))
+    wal = getattr(gw.audit, "wal", None)
+    if wal is not None:
+        REGISTRY.gauge(
+            "gateway_audit_wal_unshipped",
+            "Audit records on disk not yet acknowledged by the sink").set(
+                len(gw.audit.recover()))
+    if decision.source.startswith("degraded_"):
+        REGISTRY.counter(
+            "gateway_velocity_errors_total",
+            "Velocity store failures").inc({"source": decision.source})
 
     return AuthResponse(
         request_id=decision.request_id, decision=decision.decision,

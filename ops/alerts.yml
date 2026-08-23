@@ -1,0 +1,192 @@
+# Prometheus alerting rules for the pre-auth gateway.
+#
+# NOTHING SCRAPES THESE. There is no Prometheus server in this environment and
+# no Alertmanager, so these rules have never fired. They are written as a
+# deliverable in their own right, because the ranking and the `for` clauses are
+# the reasoning, and the reasoning is the part that transfers.
+#
+# The rule that shapes every alert below: PAGE ON SYMPTOMS THE CUSTOMER FEELS,
+# TICKET ON CAUSES. A model service that is down at 03:00 with the gateway
+# happily degrading to rules is not worth waking anyone for; an approval rate
+# that has moved 30% is, whatever the cause turns out to be.
+#
+# Every `for` duration is a decision about how long the condition may persist
+# before it is worth a human. A rule with `for: 0s` fires on a scrape blip and
+# teaches its audience to close it unread, which is worse than not having it.
+
+groups:
+  - name: preauth-slo
+    interval: 15s
+    rules:
+
+      # ---------------------------------------------------------------- SLO
+      - alert: PreauthP99OverBudget
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(gateway_decision_latency_ms_bucket[5m]))) > 100
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "p99 over the 100ms budget for 5 minutes"
+          description: >-
+            The end-to-end budget is 100ms and this is the promise, not a
+            target. Five minutes rather than one because a single slow scrape
+            window is noise; five consecutive is a state.
+          runbook: "Check which STAGE moved -- gateway_stage_latency_ms_<stage>.
+            An SLO breach that does not say which stage is an alert nobody can
+            act on."
+
+      - alert: PreauthModelStageOverAllocation
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(gateway_stage_latency_ms_model_bucket[5m]))) > 30
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "the model stage is over its 30ms allocation"
+          description: >-
+            A stage over budget while the end-to-end SLO still passes is the
+            useful shape: it is the stage with no headroom, so it is the one
+            that breaks first. That is a ticket, not a page -- nothing is broken
+            yet. Measured at 30.16ms against its 30ms allocation on the current
+            build, so this rule is one bad afternoon away from firing.
+          note: >-
+            The 30 is a literal because the exporter emits one histogram per
+            stage rather than a labelled one, so there is nothing to join the
+            budget against. A real deployment carries the budgets in a recording
+            rule; duplicating them here is the version that can drift, and this
+            note is the honest label on that.
+
+      - alert: PreauthVelocityStageOverAllocation
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(gateway_stage_latency_ms_velocity_bucket[5m]))) > 20
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "the velocity stage is over its 20ms allocation"
+          description: >-
+            Velocity measures 0.04ms in the budget table -- it is a mutex and a
+            deque append. If this fires at 20ms, the stage is not slow; something
+            is holding the GIL. An earlier build reported 125ms here because the
+            model stub busy-waited, and the table was measuring contention rather
+            than stage cost.
+
+      # ------------------------------------------------------ the real signal
+      - alert: PreauthApprovalRateShift
+        expr: |
+          abs(
+            sum(rate(gateway_decisions_total{decision="approve"}[15m]))
+            / sum(rate(gateway_decisions_total[15m]))
+            -
+            sum(rate(gateway_decisions_total{decision="approve"}[15m] offset 1d))
+            / sum(rate(gateway_decisions_total[15m] offset 1d))
+          ) > 0.05
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "approval rate moved >5pp against the same time yesterday"
+          description: >-
+            This is the alert that matters most and it is deliberately not a
+            latency alert. A 5-point move in approval rate is either fraud
+            getting through or good customers being declined, and both cost
+            money immediately. Compared against the same time YESTERDAY rather
+            than against an hour ago, because approval rate has a daily shape
+            and comparing it to itself an hour ago fires every morning.
+
+      - alert: PreauthLatencyImprovedSuspiciously
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(gateway_decision_latency_ms_bucket[10m]))) < 10
+          and
+          sum(rate(gateway_decisions_total{source="model"}[10m]))
+            / sum(rate(gateway_decisions_total[10m])) < 0.5
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "p99 fell below 10ms while under half of decisions used the model"
+          description: >-
+            Measured in the chaos drill: killing the model service took p99 from
+            33.63ms to 2.51ms. A latency improvement with no deploy behind it
+            means something stopped happening. This is the only rule here that
+            fires because a graph got BETTER, and it exists because the graph
+            everyone watches during that incident is the wrong one.
+
+      # ------------------------------------------------------- dependencies
+      - alert: PreauthModelServiceDown
+        expr: |
+          sum(rate(gateway_decisions_total{source=~"degraded_.*"}[5m]))
+            / sum(rate(gateway_decisions_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "over 20% of decisions are being made without the model"
+          description: >-
+            A TICKET, not a page. The gateway is doing exactly what the
+            degradation policy says: fail open under $50, rules only to $500,
+            fail closed above. Nobody is being woken for a dependency the design
+            already survives -- what would page is the approval-rate rule above,
+            if the degradation is actually costing money.
+
+      - alert: PreauthVelocityStoreDown
+        expr: |
+          sum(rate(gateway_velocity_errors_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "velocity store is erroring"
+          description: >-
+            This one DOES page, and it is a harder call than the model being
+            down. Without a counter the gateway cannot see a carding attack, and
+            burst traffic is exactly the pattern that needs it. The current
+            posture -- fail open under $50 -- is a decision made in the dark and
+            the README says so; the alert exists so somebody is awake to make it
+            in the light.
+
+      # ------------------------------------------------------ the WAL and audit
+      - alert: PreauthAuditBufferGrowing
+        expr: gateway_audit_buffer_size > 50000
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "audit buffer has exceeded 50k records and is not draining"
+          description: >-
+            Measured in the 1800s soak: the buffer grew to 180,053 records and
+            never drained, because nothing in that process drains it. In
+            production this is an unbounded memory growth curve, and the WAL
+            bounds the DATA loss but not the memory.
+
+      - alert: PreauthAuditWalNotShipping
+        expr: |
+          gateway_audit_wal_unshipped > 10000
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "WAL has over 10k unshipped records"
+          description: >-
+            The WAL is a bridge to the remote sink, not a destination. A disk
+            that dies takes it with it, so a WAL that stops draining is an
+            increasing window of records that exist in exactly one place.
+
+      # ------------------------------------------------------------ silence
+      - alert: PreauthNoTraffic
+        expr: sum(rate(gateway_decisions_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "no decisions in 5 minutes"
+          description: >-
+            A gateway with no traffic and a gateway that is down look identical
+            on every other panel on the dashboard. This is the only rule that
+            distinguishes them, and it is the reason the dashboard has a
+            request-rate panel at the top rather than a latency panel.
