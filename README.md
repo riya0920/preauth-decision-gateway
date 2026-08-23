@@ -7,7 +7,7 @@ gauges**, an open-loop load generator, the **spec's full 30-minute soak actually
 run**, a **separate model process** serving two transports with real CPU
 contention, **ML-1's actual trained model wired in**, a **durable audit WAL in
 the service path**, and **alert rules and a dashboard that cannot drift away
-from the exporter** -- **53 tests**.
+from the exporter** -- **56 tests**.
 
 ```bash
 python run_load.py            # budget table + 4 chaos drills
@@ -15,7 +15,7 @@ python run_soak.py            # open-loop load curve + soak
 python run_transports.py      # HTTP vs binary framing, separate model process
 python run_soak.py --soak-seconds 1800   # the spec's 30-minute soak
 python run_wal.py             # audit durability: fsync cost, and the crash
-python -m pytest tests -q     # 53 tests
+python -m pytest tests -q     # 56 tests
 uvicorn serve:app --port 8080
 curl -s localhost:8080/metrics
 ```
