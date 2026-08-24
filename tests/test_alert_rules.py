@@ -178,3 +178,72 @@ def test_every_panel_explains_itself():
     board = json.loads(DASHBOARD.read_text(encoding="utf-8"))
     for panel in board["panels"]:
         assert len(panel.get("description", "")) > 60, panel["title"]
+
+
+# ------------------------------------------------------- Alertmanager
+AM = Path(__file__).resolve().parents[1] / "ops" / "alertmanager.yml"
+
+
+@pytest.fixture(scope="module")
+def am():
+    return yaml.safe_load(AM.read_text(encoding="utf-8"))
+
+
+def test_pages_and_tickets_route_to_different_receivers(am):
+    """The severity label on every rule exists FOR this split -- it is why
+    severity is a label rather than prose in the description."""
+    routes = am["route"]["routes"]
+    by_sev = {}
+    for r in routes:
+        for m in r["matchers"]:
+            if m.startswith("severity"):
+                by_sev[m.split("=")[-1].strip().strip('"')] = r["receiver"]
+    assert by_sev["page"] != by_sev["ticket"]
+
+
+def test_a_page_repeats_sooner_than_a_ticket(am):
+    """An unacknowledged page has to come back, or a rota that misses one
+    notification misses the incident."""
+    def repeat(sev):
+        for r in am["route"]["routes"]:
+            if any('severity = "{}"'.format(sev) in m or
+                   "severity = \"{}\"".format(sev) in m for m in r["matchers"]):
+                return r["repeat_interval"]
+        return am["route"]["repeat_interval"]
+
+    assert repeat("page") == "4h"
+    assert repeat("ticket") == "24h"
+
+
+def test_alerts_are_grouped_so_one_incident_is_one_notification(am):
+    """A dying model trips three rules. Grouping by instance would send three
+    messages for one event."""
+    assert "alertname" in am["route"]["group_by"]
+    assert "instance" not in am["route"]["group_by"]
+
+
+def test_no_traffic_inhibits_the_latency_alerts(am):
+    """Nothing can be slow when nothing is happening. Without this an outage
+    pages three times and buries the one alert that says what happened."""
+    sources = []
+    for rule in am["inhibit_rules"]:
+        sources.extend(rule["source_matchers"])
+    assert any("PreauthNoTraffic" in m for m in sources)
+
+
+def test_a_dead_model_inhibits_the_suspicious_improvement_alert(am):
+    """They are the same event. Firing both makes the rota work that out."""
+    pairs = [(str(r["source_matchers"]), str(r["target_matchers"]))
+             for r in am["inhibit_rules"]]
+    assert any("PreauthModelServiceDown" in s and
+               "PreauthLatencyImprovedSuspiciously" in t for s, t in pairs)
+
+
+def test_every_receiver_named_by_a_route_exists(am):
+    """A route pointing at a receiver that does not exist is an alert that
+    fires into nothing -- the exact failure Alertmanager was added to fix."""
+    defined = {r["name"] for r in am["receivers"]}
+    used = {am["route"]["receiver"]}
+    used |= {r["receiver"] for r in am["route"]["routes"]}
+    assert used <= defined, "routes point at undefined receivers: {}".format(
+        used - defined)

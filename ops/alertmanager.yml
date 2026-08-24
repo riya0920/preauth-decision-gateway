@@ -1,0 +1,97 @@
+# Alertmanager routing for the pre-auth gateway.
+#
+# Prometheus decides WHEN a rule is true. Alertmanager decides WHO finds out,
+# HOW OFTEN, and WHEN TO STOP. A firing rule with nowhere to go is a red row on
+# a page nobody has open, which is most of the value of alerting and was this
+# project's largest remaining gap.
+#
+# THE FOUR THINGS THIS DOES THAT PROMETHEUS CANNOT:
+#
+#   ROUTE        a page goes to a human at 03:00; a ticket goes to a queue. The
+#                severity label the rules already carry is what splits them, and
+#                that split is the entire reason severity was a label rather
+#                than prose in the description.
+#
+#   GROUP        one incident usually trips several rules. The model service
+#                dying fires PreauthModelServiceDown AND moves the approval
+#                rate AND drops the p99 -- three notifications for one event.
+#                Grouping by alertname+severity sends one.
+#
+#   INHIBIT      when the gateway has no traffic at all, "the model stage is
+#                over its allocation" is noise: there is nothing to be slow.
+#                PreauthNoTraffic therefore suppresses the latency alerts, and
+#                without that rule an outage pages three times and buries the
+#                one alert that says what happened.
+#
+#   REPEAT       an unacknowledged page has to come back, or a rota that misses
+#                one notification misses the incident. Four hours for a page,
+#                one day for a ticket.
+#
+# NOTHING IS ACTUALLY DELIVERED. The receivers below point at a local webhook
+# sink, because there is no PagerDuty account and no SMTP server here. The
+# routing, grouping, inhibition and repeat logic are real and testable with
+# `amtool`; the last hop is not.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  # Group by the alert and its severity, NOT by instance -- one gateway with
+  # three firing rules should be one notification, not three.
+  group_by: ['alertname', 'severity']
+  # Wait for siblings before sending: an incident that trips three rules within
+  # 30s arrives as one message rather than a burst.
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 24h
+  receiver: ticket-queue
+
+  routes:
+    - matchers:
+        - severity = "page"
+      receiver: oncall-page
+      # Shorter, because a page is by definition something that cannot wait for
+      # the next working day.
+      group_wait: 10s
+      repeat_interval: 4h
+
+    - matchers:
+        - severity = "ticket"
+      receiver: ticket-queue
+      repeat_interval: 24h
+
+inhibit_rules:
+  # No traffic means nothing can be slow. Without this, an outage pages for
+  # latency, for the stage budget, AND for the silence -- and the third is the
+  # only one that says what happened.
+  - source_matchers:
+      - alertname = "PreauthNoTraffic"
+    target_matchers:
+      - alertname =~ "Preauth.*(OverBudget|OverAllocation|ImprovedSuspiciously)"
+    equal: ['job']
+
+  # A dead model explains the latency improvement. Firing both means the rota
+  # has to work out that they are the same event.
+  - source_matchers:
+      - alertname = "PreauthModelServiceDown"
+    target_matchers:
+      - alertname = "PreauthLatencyImprovedSuspiciously"
+    equal: ['job']
+
+  # A page supersedes a ticket for the same alert.
+  - source_matchers:
+      - severity = "page"
+    target_matchers:
+      - severity = "ticket"
+    equal: ['alertname']
+
+receivers:
+  - name: oncall-page
+    webhook_configs:
+      - url: http://127.0.0.1:9099/page
+        send_resolved: true
+
+  - name: ticket-queue
+    webhook_configs:
+      - url: http://127.0.0.1:9099/ticket
+        send_resolved: true

@@ -1,13 +1,13 @@
 # SE-3 — Low-Latency Pre-Auth Decision Gateway
 
-**Status: ~97%.** Latency budget, race-free velocity counters (in-process
+**Status: ~98%.** Latency budget, race-free velocity counters (in-process
 **and on Redis with an atomic Lua script**), tiered degradation, chaos drills,
 HTTP service, per-feature freshness policy, Prometheus metrics **including
 gauges**, an open-loop load generator, the **spec's full 30-minute soak actually
 run**, a **separate model process** serving two transports with real CPU
 contention, **ML-1's actual trained model wired in**, a **durable audit WAL in
 the service path**, and **alert rules and a dashboard that cannot drift away
-from the exporter** -- **59 tests**.
+from the exporter** -- **65 tests**.
 
 ```bash
 python run_load.py            # budget table + 4 chaos drills
@@ -18,7 +18,7 @@ python run_wal.py             # audit durability: fsync cost, and the crash
 python run_redis_real.py      # the velocity counter on a REAL Redis server
 python run_prometheus_drill.py   # load the rules into Prometheus and fire one
 GATEWAY_REDIS_URL=redis://127.0.0.1:6379/0 uvicorn serve:app --port 8080
-python -m pytest tests -q     # 59 tests
+python -m pytest tests -q     # 65 tests
 uvicorn serve:app --port 8080
 curl -s localhost:8080/metrics
 ```
@@ -385,6 +385,50 @@ proved the gateway handles a dead Redis was talking to a live one. Moved to a
 port verified closed, and the behaviour does hold: it raises rather than
 returning a wrong count, which is what lets the gateway tell "no attack" apart
 from "cannot see".
+
+## Alertmanager: rules now have somewhere to go
+
+Prometheus decides *when* a rule is true. Alertmanager decides *who finds out,
+how often, and when to stop* — and a firing rule with nowhere to go is a red row
+on a page nobody has open, which was this project's largest remaining gap.
+
+`ops/alertmanager.yml` validates (`amtool check-config`: 3 inhibit rules, 2
+receivers) and the routing tree is proven rather than asserted:
+
+```
+Routing tree:
+.
+└── default-route  receiver: ticket-queue
+    ├── {severity="page"}  receiver: oncall-page
+    └── {severity="ticket"}  receiver: ticket-queue
+
+severity=page      -> oncall-page
+severity=ticket    -> ticket-queue
+no severity label  -> ticket-queue
+```
+
+**That split is why `severity` was a label rather than prose in the
+description.** A page goes to a human at 03:00; a ticket goes to a queue.
+
+Three behaviours Prometheus cannot provide on its own:
+
+- **Grouping.** One incident trips several rules — a dying model fires
+  `PreauthModelServiceDown`, moves the approval rate, *and* drops the p99.
+  Grouping on `alertname`+`severity` rather than `instance` makes that one
+  notification instead of three.
+- **Inhibition.** When there is no traffic, "the model stage is over its
+  allocation" is noise — nothing can be slow when nothing is happening. So
+  `PreauthNoTraffic` suppresses the latency alerts, and a dead model suppresses
+  the suspicious-improvement alert because **they are the same event**. Without
+  those two rules an outage pages three times and buries the one alert that says
+  what happened.
+- **Repeat.** A page returns after 4h, a ticket after 24h. An unacknowledged
+  page that never comes back means a rota which misses one notification misses
+  the incident.
+
+A test asserts every receiver named by a route actually exists — a route
+pointing at a missing receiver is an alert firing into nothing, which is the
+exact failure Alertmanager was added to fix.
 
 ## What is NOT built
 
