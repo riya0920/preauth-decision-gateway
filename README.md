@@ -16,6 +16,7 @@ python run_transports.py      # HTTP vs binary framing, separate model process
 python run_soak.py --soak-seconds 1800   # the spec's 30-minute soak
 python run_wal.py             # audit durability: fsync cost, and the crash
 python run_redis_real.py      # the velocity counter on a REAL Redis server
+python run_prometheus_drill.py   # load the rules into Prometheus and fire one
 python -m pytest tests -q     # 57 tests
 uvicorn serve:app --port 8080
 curl -s localhost:8080/metrics
@@ -285,34 +286,85 @@ But 2,000ms is longer than the entire 20ms budget, so **failing takes longer tha
 succeeding**, and the gateway needs a client timeout shorter than its own budget
 rather than the library default.
 
+## The alert rules, in a real Prometheus
+
+`tests/test_alert_rules.py` asserts every metric the rules name is exported.
+That catches drift and it does not answer the next question: **would these rules
+ever fire?** A rule can name real metrics and still be unfirable — PromQL that
+never evaluates true, a label that is not on the series, a `for` clause longer
+than any real incident.
+
+`run_prometheus_drill.py` runs the gateway's **own container**, points a real
+Prometheus 3.5.0 at it, and asks Prometheus:
+
+```
+promtool check rules            SUCCESS: 10 rules found
+container status                running, /health ok, model_up true
+gateway_ metric lines exported  123
+target preauth-gateway          up
+sum(gateway_decisions_total)    200
+
+rules loaded : 10
+BROKEN PromQL: 0
+
+   t+   0s   pending
+   t+ 288s   firing
+```
+
+**All ten rules evaluate cleanly and `PreauthNoTraffic` fired.** Not merely valid
+YAML, not merely valid PromQL — it evaluated true against real scraped series and
+transitioned all the way to firing.
+
+It is the rule chosen deliberately, because it can be caused **honestly**: stop
+sending requests. Forcing a latency breach would mean rigging the gateway, and a
+rule proven by a rigged input is proven against the rig. Its `for: 5m` sits on
+top of a 5m rate window, so it took 288 seconds of real quiet — the drill waits
+rather than pretending.
+
+Running the container also settles a separate open item: **the image runs**, not
+just builds. It answered `/health` with `model_up: true` and served 200 authorize
+requests.
+
+Three harness bugs this drill had to fix in itself, all worth naming because each
+produced a *confident wrong reading*:
+
+- **`health: unknown` is not `health: err`.** A rule reports `unknown` until it
+  has been evaluated once. The first version counted that as broken and reported
+  "unhealthy: 10" against ten perfectly good rules.
+- **Querying before the first scrape lands** returns an empty result set, which
+  reads as "the gateway exports nothing" rather than "ask again in a moment".
+- **`setsid ... & disown` does not survive `wsl -- bash -lc`.** The whole WSL
+  session goes away when the command returns, and Prometheus logged a polite
+  "See you next time!" every single time. Kafka had the identical problem.
+  systemd owns the process now.
+
 ## What is NOT built
 
-1. **Redis on the gateway's hot path.** The counter is now verified against a
-   real server, and `Gateway` still constructs the in-process one. Swapping it is
-   a constructor change — and the three findings above say what swapping it
-   actually costs, which is the part that was previously unknown.
-2. **A connection pool sized to the workload**, and a client timeout shorter than
-   the velocity budget. Both are one-liners with a sizing argument behind them
-   that this has not made.
-3. **gRPC itself.** `run_transports.py` runs a genuinely separate model PROCESS
+1. **Alertmanager.** Rules fire and nothing routes, deduplicates, silences or
+   pages. **A firing rule with nowhere to go is a red row on a page nobody has
+   open** — which is most of the value of alerting, and it is not here.
+2. **Grafana.** `ops/dashboard.json` is asserted against the real exporter by
+   tests and has never been rendered by the thing that would render it.
+3. **Redis on the gateway's hot path.** The counter is verified against a real
+   server; `Gateway` still constructs the in-process one. Swapping it is a
+   constructor change, and the Redis findings above say what swapping it costs.
+4. **A connection pool sized to the workload**, and a client timeout shorter than
+   the 20ms velocity budget. Both are one-liners with a sizing argument behind
+   them that this has not made.
+5. **gRPC itself.** `run_transports.py` runs a genuinely separate model PROCESS
    and compares pooled keep-alive HTTP against length-prefixed binary framing on
    loopback. Binary is 2.07ms faster at p50 — and at 32 concurrent callers it
    timed out **95 times against HTTP's 14**. It wins the microbenchmark and loses
    the failure mode, and that is the actual argument for gRPC.
-4. **Prometheus and Grafana actually running.** `ops/alerts.yml` and
-   `ops/dashboard.json` are tested against the real exporter — every metric they
-   name is asserted to exist — but no server has loaded them and no alert has
-   ever fired.
-5. **A load curve that says anything about a REAL gateway.** `run_soak.py` is a
+6. **A load curve that says anything about a REAL gateway.** `run_soak.py` is a
    proper open-loop generator and `offered` tracks `target` exactly, so the
-   harness is not the bottleneck. But it finds no knee up to 800 RPS, and that is
-   a fact about the *stub*: a sleeping model releases the GIL, so nothing
-   contends.
-6. **The velocity-store-down posture is still unresolved.** With no counter the
+   harness is not the bottleneck. It finds no knee up to 800 RPS, and that is a
+   fact about the *stub*: a sleeping model releases the GIL, so nothing contends.
+7. **The velocity-store-down posture is still unresolved.** With no counter the
    gateway cannot see a carding attack, and burst traffic is exactly the pattern
    that needs it. Failing open under $50 is a decision made in the dark.
-7. **A multi-day soak.** Thirty minutes bounds the leak rate and does not bound
+8. **A multi-day soak.** Thirty minutes bounds the leak rate and does not bound
    the leak; both growth curves it found are still growing.
-8. **WAL shipping and truncation.** `recover()` returns what a restart must
+9. **WAL shipping and truncation.** `recover()` returns what a restart must
    re-ship; nothing ships it and nothing truncates the WAL once records are
    acknowledged.
