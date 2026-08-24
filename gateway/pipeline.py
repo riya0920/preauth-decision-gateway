@@ -30,6 +30,17 @@ from .budget import Budget
 from .features import FeatureCache, assemble
 from .velocity import SafeCounter
 
+# The gateway does not care WHICH counter it holds -- in-process or Redis-backed
+# -- but it has to catch both of their "I cannot see" exceptions. Catching only
+# SafeCounter.Unavailable meant that swapping in the Redis counter turned a
+# degradation into a 500: the request died instead of falling back to rules.
+try:
+    from .redis_velocity import RedisVelocity
+
+    _VELOCITY_UNAVAILABLE = (SafeCounter.Unavailable, RedisVelocity.Unavailable)
+except Exception:                                            # noqa: BLE001
+    _VELOCITY_UNAVAILABLE = (SafeCounter.Unavailable,)
+
 # amount ceiling (minor units) -> behaviour when the model is unavailable
 DEGRADATION_TIERS = [
     (5_000, "approve"),         # < $50   fail open
@@ -201,7 +212,7 @@ class Gateway:
         try:
             v_card = self.velocity.incr_and_count("card:" + req.card_id, req.now_ms)
             velocity_available = True
-        except SafeCounter.Unavailable:
+        except _VELOCITY_UNAVAILABLE:
             v_card, velocity_available = 0, False
             reasons.append("velocity_store_down")
         self.budget.record("velocity", _ms_since(t))

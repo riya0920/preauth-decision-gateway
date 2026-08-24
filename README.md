@@ -7,7 +7,7 @@ gauges**, an open-loop load generator, the **spec's full 30-minute soak actually
 run**, a **separate model process** serving two transports with real CPU
 contention, **ML-1's actual trained model wired in**, a **durable audit WAL in
 the service path**, and **alert rules and a dashboard that cannot drift away
-from the exporter** -- **57 tests**.
+from the exporter** -- **59 tests**.
 
 ```bash
 python run_load.py            # budget table + 4 chaos drills
@@ -17,7 +17,8 @@ python run_soak.py --soak-seconds 1800   # the spec's 30-minute soak
 python run_wal.py             # audit durability: fsync cost, and the crash
 python run_redis_real.py      # the velocity counter on a REAL Redis server
 python run_prometheus_drill.py   # load the rules into Prometheus and fire one
-python -m pytest tests -q     # 57 tests
+GATEWAY_REDIS_URL=redis://127.0.0.1:6379/0 uvicorn serve:app --port 8080
+python -m pytest tests -q     # 59 tests
 uvicorn serve:app --port 8080
 curl -s localhost:8080/metrics
 ```
@@ -338,19 +339,66 @@ produced a *confident wrong reading*:
   "See you next time!" every single time. Kafka had the identical problem.
   systemd owns the process now.
 
+## Redis on the hot path, and the budget it breaks
+
+`GATEWAY_REDIS_URL` now selects the Redis-backed counter; without it the gateway
+uses the in-process one. Opt-in rather than default, because a service that
+silently requires Redis to start is a service that will not start.
+
+**Wiring it found a real bug immediately.** `Gateway` caught only
+`SafeCounter.Unavailable`, so a `RedisVelocity` failure escaped the handler and
+the request died with a **500 instead of falling back to rules**. The whole point
+of the stage is its degradation policy, and a gateway that 500s when its counter
+is down does not have a policy — it has a dependency.
+
+### The timeout took three attempts, and the failures are the lesson
+
+| attempt | reasoning | result |
+|---|---|---|
+| 15 ms | "inside the 20ms budget" | **timed out healthy calls** — p50 is 17.7ms, so it sat below the dependency's own median |
+| 250 ms | "generous enough" | counter returned **88 of 10,000** — the measured max is ~1,800ms, so it discarded the tail |
+| **1.0 s** | set from the measured distribution | exact 10,000/10,000; dead-server failure drops from 2,039ms to **1,030ms** |
+
+**A timeout must sit above the healthy p99, not below the budget.** Setting it
+from the budget instead of from the measurement turns every slow-but-fine request
+into an outage — which is the first row of that table, and it is the version that
+looks most principled on paper.
+
+### The conclusion I did not want
+
+With a bounded pool and a sane timeout: **p50 23ms, p99 196ms, max 368ms**
+against a **20 ms** velocity allocation.
+
+**Redis does not fit this budget.** Not because Redis is slow, and not because
+the pool is wrong — the p50 alone exceeds the whole allocation over this
+transport. The budget table earlier in this README was written against an
+in-process counter, and adopting Redis means either rewriting the budget or
+co-locating Redis so the hop is a loopback rather than a cross-VM one. Keeping
+the old 20 ms number while running a network dependency behind it would be a
+number that is true of a system nobody is running.
+
+### And one more: my "dead server" was alive
+
+The failure drill pointed at port 6399 and reported a clean `Unavailable` after
+2,039ms. Port 6399 turned out to be **open on this machine** — so the test that
+proved the gateway handles a dead Redis was talking to a live one. Moved to a
+port verified closed, and the behaviour does hold: it raises rather than
+returning a wrong count, which is what lets the gateway tell "no attack" apart
+from "cannot see".
+
 ## What is NOT built
 
 1. **Alertmanager.** Rules fire and nothing routes, deduplicates, silences or
-   pages. **A firing rule with nowhere to go is a red row on a page nobody has
-   open** — which is most of the value of alerting, and it is not here.
+   pages. A firing rule with nowhere to go is a red row on a page nobody has
+   open, and that is most of the value of alerting.
 2. **Grafana.** `ops/dashboard.json` is asserted against the real exporter by
    tests and has never been rendered by the thing that would render it.
-3. **Redis on the gateway's hot path.** The counter is verified against a real
-   server; `Gateway` still constructs the in-process one. Swapping it is a
-   constructor change, and the Redis findings above say what swapping it costs.
-4. **A connection pool sized to the workload**, and a client timeout shorter than
-   the 20ms velocity budget. Both are one-liners with a sizing argument behind
-   them that this has not made.
+3. **A velocity budget that matches the dependency.** The measurement above says
+   the 20ms allocation and a network Redis are incompatible. Deciding which one
+   moves is a design decision this has surfaced and not made.
+4. **Co-located Redis.** Every Redis number here crosses a WSL virtual NIC. A
+   sidecar or same-host server would change the distribution enough that the
+   budget question might answer itself, and that is untested.
 5. **gRPC itself.** `run_transports.py` runs a genuinely separate model PROCESS
    and compares pooled keep-alive HTTP against length-prefixed binary framing on
    loopback. Binary is 2.07ms faster at p50 — and at 32 concurrent callers it

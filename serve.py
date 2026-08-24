@@ -51,7 +51,19 @@ async def lifespan(_app):
     wal = AuditWal(Path(os.environ.get("GATEWAY_WAL", "data/audit.wal.jsonl")),
                    fsync=os.environ.get("GATEWAY_WAL_FSYNC", "batch"))
     audit = DurableAuditLog(wal)
-    gw = Gateway(ModelService(), SafeCounter(), budget, audit)
+    # GATEWAY_REDIS_URL selects the real counter; absent, the in-process one.
+    # Opt-in rather than default, because the Redis path adds a network hop to
+    # a 20ms stage and that is a deployment decision, not a library default --
+    # and because a service that silently requires Redis to start is a service
+    # that will not start.
+    redis_url = os.environ.get("GATEWAY_REDIS_URL")
+    if redis_url:
+        from gateway.redis_velocity import RedisVelocity, connect as redis_connect
+
+        counter = RedisVelocity(redis_connect(redis_url), window_ms=60_000)
+    else:
+        counter = SafeCounter()
+    gw = Gateway(ModelService(), counter, budget, audit)
     gw.feature_cache = FeatureCache()
     _state.update({"gw": gw, "budget": budget, "wal": wal})
     yield

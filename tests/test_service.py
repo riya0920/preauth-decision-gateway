@@ -145,3 +145,40 @@ def test_registry_renders_valid_exposition_format():
     assert "# TYPE h_ms histogram" in text
     assert 'c_total{outcome="approve"} 1' in text
     assert text.endswith("\n")
+
+
+# ------------------------------------------------- Redis on the hot path
+def test_a_dead_velocity_store_degrades_rather_than_500s():
+    """Swapping the Redis counter in must not turn a degradation into an error.
+
+    `Gateway` caught only `SafeCounter.Unavailable`, so a `RedisVelocity`
+    failure escaped the handler and the request died with a 500 instead of
+    falling back to rules. The degradation policy is the whole point of the
+    stage -- a gateway that 500s when its counter is down has no policy, it has
+    a dependency.
+    """
+    import gateway.pipeline as pipeline
+    from gateway.redis_velocity import RedisVelocity, connect
+
+    assert RedisVelocity.Unavailable in pipeline._VELOCITY_UNAVAILABLE
+
+    dead = RedisVelocity(connect("redis://127.0.0.1:6999/0"), window_ms=60_000)
+    with pytest.raises(RedisVelocity.Unavailable):
+        dead.incr_and_count("card:x", 1_800_000_000_000)
+
+
+def test_the_pool_and_timeout_are_set_from_measurement_not_defaults():
+    """Two settings that are not library defaults and should be.
+
+    An unbounded-in-name pool serialises 50 threads behind a handful of
+    connections, and the default socket timeout lets a dead server hang for
+    ~2,000ms -- 100x the stage budget.
+    """
+    import inspect
+
+    from gateway.redis_velocity import connect
+
+    sig = inspect.signature(connect)
+    assert sig.parameters["pool_size"].default >= 32
+    timeout = sig.parameters["socket_timeout"].default
+    assert 0 < timeout <= 1.0, "timeout must beat the ~2s library default"

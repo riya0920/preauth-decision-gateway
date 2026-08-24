@@ -176,7 +176,8 @@ def main() -> int:
     print("fakeredis structurally cannot produce -- there is no socket to cut.\n")
     import redis as redis_pkg
 
-    dead = connect("redis://127.0.0.1:6399/0")   # nothing listening
+    dead = connect("redis://127.0.0.1:6999/0")   # verified closed: 6399 turned out to be OPEN on this box, so the
+    # original "dead port" check was quietly testing a live server
     dead_counter = RedisVelocity(dead, window_ms=60_000, namespace="dead")
     t0 = time.perf_counter()
     try:

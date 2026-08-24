@@ -137,7 +137,8 @@ class NaiveRedisVelocity:
         return current + 1                          # stale read + 1
 
 
-def connect(url: str | None = None, fake: bool = False):
+def connect(url: str | None = None, fake: bool = False,
+            pool_size: int = 64, socket_timeout: float = 1.0):
     """Real Redis when a URL is given, fakeredis otherwise.
 
     fakeredis executes the same Lua, so the script's atomicity is genuinely
@@ -149,4 +150,45 @@ def connect(url: str | None = None, fake: bool = False):
         import fakeredis
         return fakeredis.FakeStrictRedis(decode_responses=True)
     import redis
-    return redis.Redis.from_url(url, decode_responses=True)
+
+    # TWO SETTINGS THAT ARE NOT DEFAULTS AND SHOULD BE.
+    #
+    # max_connections: the default pool is unbounded in name and serialised in
+    # practice -- 50 threads sharing it produced a p99 of 142ms against a 20ms
+    # velocity budget while p50 stayed at 17.7ms. That tail was almost entirely
+    # time spent waiting for a connection, not time spent in Redis. A pool
+    # sized to the worker count is the difference between measuring the
+    # dependency and measuring the queue in front of it.
+    #
+    # socket_timeout: the library default lets a call to a dead server hang for
+    # SECONDS -- measured against a dead port, ~2,000ms, which is 100x the whole
+    # stage budget. Failing must not take longer than succeeding.
+    #
+    # The first attempt set this to 0.015s, "inside the 20ms allocation", and it
+    # timed out HEALTHY calls -- because the measured p50 against this Redis is
+    # 17.7ms, so a 15ms timeout is below the dependency's own median. A timeout
+    # must sit above the healthy p99, not below the budget; setting it from the
+    # budget instead of from the measurement turns every slow-but-fine request
+    # into an outage.
+    #
+    # 0.25s was the second attempt and it was also wrong: at 50 threads the
+    # measured MAX is ~1,800ms, so a quarter-second timeout discarded most of
+    # the tail and the counter came back 88 of 10,000.
+    #
+    # 1.0s is set from the measured distribution rather than from the budget.
+    # It is still half the ~2,000ms the library default takes to fail, so the
+    # dead-server path is faster than it was, and it is nowhere near 20ms.
+    #
+    # The conclusion that actually matters, and it is uncomfortable: at a p50 of
+    # ~18ms and a max near 1.8s over this transport, Redis DOES NOT FIT a 20ms
+    # velocity budget. The budget was written against an in-process counter.
+    # Adopting Redis means either rewriting the budget or co-locating Redis so
+    # the hop is a loopback rather than a cross-VM one -- and SE-3's README says
+    # that rather than quietly keeping the old number.
+    return redis.Redis.from_url(
+        url,
+        decode_responses=True,
+        max_connections=pool_size,
+        socket_timeout=socket_timeout,
+        socket_connect_timeout=socket_timeout,
+        retry_on_timeout=False)
