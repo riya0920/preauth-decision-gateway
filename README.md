@@ -435,14 +435,22 @@ exact failure Alertmanager was added to fix.
 1. **Alertmanager.** Rules fire and nothing routes, deduplicates, silences or
    pages. A firing rule with nowhere to go is a red row on a page nobody has
    open, and that is most of the value of alerting.
-2. **Grafana.** `ops/dashboard.json` is asserted against the real exporter by
-   tests and has never been rendered by the thing that would render it.
-3. **A velocity budget that matches the dependency.** The measurement above says
-   the 20ms allocation and a network Redis are incompatible. Deciding which one
-   moves is a design decision this has surfaced and not made.
-4. **Co-located Redis.** Every Redis number here crosses a WSL virtual NIC. A
-   sidecar or same-host server would change the distribution enough that the
-   budget question might answer itself, and that is untested.
+2. ~~**Grafana.**~~ **DONE** — `run_grafana_drill.py` renders
+   `ops/dashboard.json` in a real Grafana 11.3.1 against a real Prometheus
+   scraping the real exporter, and queries every panel through Grafana's own
+   datasource proxy. All 7 panels import, the datasource binds, and 12 of 13
+   expressions return data. The 13th returns a series with zero points and is
+   correct: it is the `offset 1d` comparison, and a Prometheus started minutes
+   ago has no yesterday. See `docs/GRAFANA.md`.
+3. ~~**A velocity budget that matches the dependency.**~~ **DONE** — see
+   `docs/VELOCITY_BUDGET.md`. Co-located, the velocity check measures p50
+   0.33ms / p99 4.95ms / p999 12.04ms, so the whole distribution fits the 20ms
+   allocation. The budget stands; the deployment is the constraint.
+4. ~~**Co-located Redis.**~~ **DONE** — measured, and it answered the budget
+   question exactly as suspected: 54x faster at the median than across the WSL
+   NIC. The same run also found that `socket_timeout` does NOT bound a refused
+   connection — redis-py's retry policy does — and that tightening the timeout
+   made failure *slower*.
 5. **gRPC itself.** `run_transports.py` runs a genuinely separate model PROCESS
    and compares pooled keep-alive HTTP against length-prefixed binary framing on
    loopback. Binary is 2.07ms faster at p50 — and at 32 concurrent callers it

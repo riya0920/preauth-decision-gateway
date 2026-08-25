@@ -247,3 +247,31 @@ def test_every_receiver_named_by_a_route_exists(am):
     used |= {r["receiver"] for r in am["route"]["routes"]}
     assert used <= defined, "routes point at undefined receivers: {}".format(
         used - defined)
+
+
+# ------------------------------------------------- what the dashboard test cannot do
+def test_the_dashboard_test_is_a_schema_check_and_says_so():
+    """A guard against this suite being read as more than it is.
+
+    Every other dashboard assertion here reads `ops/dashboard.json` and checks
+    its PromQL against the exporter's metric names. That cannot tell you whether
+    Grafana ACCEPTS the file, whether the panels bind to a datasource, or
+    whether an expression that parses returns anything -- three ways to be
+    broken while every test in this file passes.
+
+    `run_grafana_drill.py` covers those, against a real Grafana. It is a drill
+    rather than a test because it needs a running Grafana, a running Prometheus
+    and a running exporter, and a unit test that silently skips when they are
+    absent would be the "skip that looks like a pass" this project keeps
+    finding.
+    """
+    from pathlib import Path
+
+    drill = Path(__file__).resolve().parents[1] / "run_grafana_drill.py"
+    assert drill.exists(), (
+        "the dashboard's only remaining coverage would be a schema check")
+    text = drill.read_text(encoding="utf-8")
+    assert "/api/ds/query" in text, (
+        "the drill must query through Grafana's datasource proxy; querying "
+        "Prometheus directly tests Prometheus and skips the two failure modes "
+        "above it")
