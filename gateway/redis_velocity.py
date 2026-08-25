@@ -138,7 +138,8 @@ class NaiveRedisVelocity:
 
 
 def connect(url: str | None = None, fake: bool = False,
-            pool_size: int = 64, socket_timeout: float = 1.0):
+            pool_size: int = 64, socket_timeout: float = 1.0,
+            retries: int = 0):
     """Real Redis when a URL is given, fakeredis otherwise.
 
     fakeredis executes the same Lua, so the script's atomicity is genuinely
@@ -185,10 +186,76 @@ def connect(url: str | None = None, fake: bool = False,
     # Adopting Redis means either rewriting the budget or co-locating Redis so
     # the hop is a loopback rather than a cross-VM one -- and SE-3's README says
     # that rather than quietly keeping the old number.
+    #
+    # ------------------------------------------------------------------
+    # CO-LOCATION WAS THE OPEN QUESTION AND IT IS NOW MEASURED.
+    #
+    # Every number above was taken from Windows across the WSL boundary. Run
+    # from a process ON THE SAME HOST as Redis, the same Lua script measures:
+    #
+    #     p50 0.33ms   p90 0.62ms   p99 4.95ms   p999 12.04ms   max 15.30ms
+    #
+    # A 54x improvement at the median, and the whole distribution including the
+    # p999 fits inside the 20ms allocation. So the answer to the question this
+    # comment posed is: co-locating Redis makes it fit, and the budget does not
+    # need rewriting for the HEALTHY path.
+    #
+    # A second measurement from the same run, which refutes a hypothesis rather
+    # than confirming one: latency does NOT track window size. A key holding
+    # 5,400 members measures p50 0.31ms against 0.28ms for one holding 410. The
+    # expectation was that a velocity window under attack -- which is exactly
+    # when the set is largest -- would be slower to evaluate. At these sizes
+    # ZREMRANGEBYSCORE, ZADD and ZCARD are all dominated by scheduler noise, and
+    # the tail belongs to the round trip rather than to Redis's work. A bare
+    # PING measures p99 6.31ms, HIGHER than the script's 4.95ms.
+    # ------------------------------------------------------------------
+    #
+    # THE FAILURE PATH IS STILL BROKEN, AND NOT FOR THE REASON WRITTEN ABOVE.
+    #
+    # `retry_on_timeout=False` was set here in the belief that it stopped
+    # retrying. It does not. redis-py 8.x separately defaults every connection
+    # to `Retry(ExponentialWithJitterBackoff(), retries=10)` covering
+    # ConnectionError, and that policy -- not the socket timeout -- is what
+    # governs how long a dead server takes to fail. Measured against a closed
+    # port:
+    #
+    #     socket_timeout=1.0s,   default retry  -> 3,234ms
+    #     socket_timeout=0.015s, default retry  -> 4,061ms   (TIGHTER IS SLOWER)
+    #     socket_timeout=1.0s,   retries=0      ->     0.4ms
+    #     raw TCP connect, no redis at all      ->     0.5ms
+    #
+    # Tightening the timeout made failure SLOWER, because a shorter timeout lets
+    # more of the ten retries complete inside the same wall clock while the
+    # exponential backoff accumulates. And the timeout is irrelevant to a
+    # refused connection in the first place: the RST arrives in half a
+    # millisecond, so with retries off the client fails at the speed of TCP.
+    #
+    # SO THE TWO FAILURE MODES NEED TWO DIFFERENT CONTROLS, and conflating them
+    # is what the earlier advice in run_redis_real.py did:
+    #
+    #   CONNECTION REFUSED   Redis is down. Bounded by the RETRY POLICY. The
+    #                        socket timeout does nothing here.
+    #   ACCEPTS BUT STALLS   Redis is up and wedged -- a long GC pause, a
+    #                        saturated box, a network black hole. Bounded by
+    #                        `socket_timeout`, and ONLY by it. Measured against a
+    #                        socket that accepts and never replies: 1,003ms at
+    #                        the 1.0s default, 16ms at a 15ms timeout. Exactly as
+    #                        advertised, for this case and no other.
+    #
+    # `retries` is therefore set explicitly rather than left to the library.
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
+
     return redis.Redis.from_url(
         url,
         decode_responses=True,
         max_connections=pool_size,
         socket_timeout=socket_timeout,
         socket_connect_timeout=socket_timeout,
+        # Zero retries at the CLIENT. A velocity check that is worth retrying is
+        # worth retrying inside a deadline the caller owns, not inside a library
+        # whose backoff schedule the caller cannot see. Ten retries with
+        # exponential backoff behind a 20ms budget is a 3-second stall wearing a
+        # 20ms label.
+        retry=Retry(NoBackoff(), retries),
         retry_on_timeout=False)
