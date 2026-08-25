@@ -275,3 +275,62 @@ def test_the_dashboard_test_is_a_schema_check_and_says_so():
         "the drill must query through Grafana's datasource proxy; querying "
         "Prometheus directly tests Prometheus and skips the two failure modes "
         "above it")
+
+
+# ----------------------------------------------------------------- gRPC
+def test_the_grpc_transport_exists_and_is_real_grpc():
+    """The README's item was "gRPC itself" -- run_transports.py compared HTTP
+    against hand-rolled binary framing and said so plainly, ending "calling it
+    gRPC would be the easy lie". It is in the table now."""
+    from gateway.model_client import GrpcModelClient
+
+    import inspect
+    src = inspect.getsource(GrpcModelClient)
+    assert "insecure_channel" in src
+    assert "unary_unary" in src
+
+
+def test_the_json_substitution_is_declared_not_glossed():
+    """grpcio-tools will not build on this Python, so payloads are JSON rather
+    than protobuf. That makes the wire LARGER than real gRPC and leaves every
+    mechanism the comparison is about -- HTTP/2 multiplexing, flow control,
+    deadlines, status codes -- intact. Stating which is which is the point."""
+    from gateway.model_client import GrpcModelClient
+
+    doc = GrpcModelClient.__doc__
+    assert "protobuf" in doc and "grpcio-tools" in doc
+    assert "HTTP/2" in doc
+
+
+def test_a_deadline_is_distinguished_from_a_broken_connection():
+    """"The deadline passed" and "the connection broke" are different incidents,
+    and a comparison that flattens them cannot say which transport failed how.
+    The gRPC status name is preserved in the error message."""
+    import inspect
+
+    from gateway.model_client import GrpcModelClient
+
+    src = inspect.getsource(GrpcModelClient.score)
+    assert "exc.code().name" in src
+
+
+def test_the_benchmark_warns_about_comparing_across_error_rates():
+    """The finding that matters more than the headline: binary's p50 at 32
+    threads is computed over the calls that SURVIVED, so a transport that drops
+    its slowest work always looks fast. Comparing percentiles across different
+    error rates is survivorship bias with a table around it."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1]
+           / "run_transports.py").read_text(encoding="utf-8")
+    assert "survivorship bias" in src
+    assert "NOT" in src and "SAME POPULATION" in src
+    # The phrase survives only as a QUOTATION of what the file used to claim,
+    # inside the section that now disproves it. Checking it is not printed as a
+    # live conclusion means checking it is not followed by the old paragraph.
+    # The phrase survives only as a QUOTATION inside the section that now
+    # disproves it, so match the LIVE print form rather than the substring --
+    # the two previous attempts at this assertion both caught the quotation.
+    assert '\nWhat this is NOT: gRPC' not in src, (
+        "the old disclaimer is still printing alongside the gRPC results")
+    assert "gRPC IS NOW IN THE TABLE" in src

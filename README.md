@@ -451,7 +451,27 @@ exact failure Alertmanager was added to fix.
    NIC. The same run also found that `socket_timeout` does NOT bound a refused
    connection — redis-py's retry policy does — and that tightening the timeout
    made failure *slower*.
-5. **gRPC itself.** `run_transports.py` runs a genuinely separate model PROCESS
+5. ~~**gRPC itself.**~~ **DONE, and it settled the argument the item made.**
+   Real gRPC is in the comparison — HTTP/2, deadlines, per-stream flow control,
+   status codes — with JSON payloads instead of protobuf, because
+   `grpcio-tools` will not build on this Python. That substitution makes the
+   wire LARGER than real gRPC and leaves every mechanism the comparison is
+   about intact.
+
+   The item argued binary framing "wins the microbenchmark and loses the
+   failure mode". Measured at 32 concurrent callers: **gRPC 0 errors, binary
+   80, http 53.** The claim holds.
+
+   **But the more useful finding is a caveat on the latency columns.** binary's
+   p50 of 32ms at 32 threads is computed over the calls that SURVIVED — the 80
+   that timed out contribute nothing. gRPC's 257ms is over 384 completed calls.
+   A transport that drops its slowest work always looks fast, and comparing
+   percentiles across different error rates is survivorship bias with a table
+   around it. What actually happened is the classic trade: gRPC queues behind
+   flow control and everyone waits; the others drop and the survivors look
+   quick. For a pre-auth inside a 2s deadline a 260ms answer beats a timeout —
+   on a stage with a 30ms budget it would not. Superseded note:
+   `run_transports.py` runs a genuinely separate model PROCESS
    and compares pooled keep-alive HTTP against length-prefixed binary framing on
    loopback. Binary is 2.07ms faster at p50 — and at 32 concurrent callers it
    timed out **95 times against HTTP's 14**. It wins the microbenchmark and loses

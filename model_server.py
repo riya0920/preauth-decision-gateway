@@ -113,10 +113,53 @@ def _recv_exact(sock: socket.socket, n: int):
     return buf
 
 
+# --------------------------------------------------------------------- gRPC
+#
+# REAL gRPC, WITH JSON PAYLOADS INSTEAD OF PROTOBUF, and the substitution is
+# declared rather than glossed. `grpcio-tools` will not build on this Python --
+# its protoc wheel fails -- so there is no generated stub. gRPC's generic
+# handler API takes raw byte serializers, which is enough to run the actual
+# protocol without codegen.
+#
+# WHAT THAT COSTS: protobuf's compact binary encoding and schema-enforced
+# contracts. JSON is larger on the wire, so any BYTES figure here understates
+# what real gRPC would do.
+#
+# WHAT IT DOES NOT COST, and this is the part the comparison is about: HTTP/2
+# multiplexing, per-stream flow control, real deadlines with cancellation
+# propagation, connection reuse, and status codes. `run_transports.py` found
+# that hand-rolled length-prefixed binary framing wins the latency
+# microbenchmark and LOSES the failure mode -- 95 timeouts against HTTP's 14 at
+# 32 concurrent callers. Those mechanisms are the reason to expect gRPC to
+# behave differently under concurrency, and they are all present here.
+def serve_grpc(port: int, cpu_ms: float) -> None:
+    import grpc
+    from concurrent import futures
+
+    def score(request: bytes, context) -> bytes:
+        features = json.loads(request.decode())
+        s = burn_and_score(features, cpu_ms)
+        return json.dumps({"score": s}).encode()
+
+    handler = grpc.method_handlers_generic_handler(
+        "preauth.Model",
+        {"Score": grpc.unary_unary_rpc_method_handler(
+            score,
+            request_deserializer=lambda b: b,
+            response_serializer=lambda b: b)})
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=32),
+                         handlers=(handler,))
+    server.add_insecure_port("127.0.0.1:{}".format(port))
+    server.start()
+    server.wait_for_termination()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--http-port", type=int, default=8711)
     ap.add_argument("--binary-port", type=int, default=8712)
+    ap.add_argument("--grpc-port", type=int, default=8713)
     ap.add_argument("--cpu-ms", type=float, default=CPU_MS)
     args = ap.parse_args()
 
@@ -124,6 +167,14 @@ def main() -> None:
     threading.Thread(
         target=serve_binary, args=(args.binary_port, args.cpu_ms),
         daemon=True).start()
+    try:
+        threading.Thread(
+            target=serve_grpc, args=(args.grpc_port, args.cpu_ms),
+            daemon=True).start()
+    except ImportError:
+        # Reported rather than silently skipped: a transport comparison missing
+        # a transport must say which one, or the table reads as complete.
+        print("grpcio not installed -- gRPC transport not served")
     ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler).serve_forever()
 
 

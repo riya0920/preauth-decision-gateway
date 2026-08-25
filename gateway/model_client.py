@@ -127,9 +127,11 @@ class ModelProcess:
     """Spawns model_server.py as a child process and waits for readiness."""
 
     def __init__(self, http_port: int = 8711, binary_port: int = 8712,
+                 grpc_port: int = 8713,
                  cpu_ms: float = 8.0):
         self.http_port = http_port
         self.binary_port = binary_port
+        self.grpc_port = grpc_port
         self.cpu_ms = cpu_ms
         self.proc: subprocess.Popen | None = None
 
@@ -138,6 +140,7 @@ class ModelProcess:
             [sys.executable, str(ROOT / "model_server.py"),
              "--http-port", str(self.http_port),
              "--binary-port", str(self.binary_port),
+             "--grpc-port", str(self.grpc_port),
              "--cpu-ms", str(self.cpu_ms)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.time() + wait_s
@@ -193,3 +196,61 @@ class RemoteModelService:
             "device_id": req.device_id,
             "card_id": req.card_id,
         })
+
+
+class GrpcModelClient:
+    """Real gRPC, with JSON payloads instead of protobuf.
+
+    `grpcio-tools` will not build on this Python, so there is no generated stub.
+    gRPC's generic call API takes raw byte serializers, which runs the actual
+    protocol without codegen. The substitution is declared rather than glossed:
+    JSON is larger on the wire than protobuf, so any BYTES figure understates
+    what real gRPC would do.
+
+    What is NOT substituted, and is the whole reason to test it: HTTP/2
+    multiplexing, per-stream flow control, deadlines that propagate as
+    cancellation, connection reuse, and status codes.
+
+    `run_transports.py` found hand-rolled length-prefixed binary framing wins
+    the latency microbenchmark and LOSES the failure mode -- 95 timeouts against
+    HTTP's 14 at 32 concurrent callers. Those mechanisms are the stated reason
+    to expect gRPC to behave differently, so this is the experiment rather than
+    the assertion.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 8713,
+                 timeout: float = 2.0):
+        import grpc
+
+        self.timeout = timeout
+        # One channel per client. A channel multiplexes concurrent RPCs over
+        # ONE HTTP/2 connection, which is exactly the property the binary
+        # client lacks -- it owns a socket and cannot interleave, so callers
+        # queue behind each other and time out under concurrency.
+        self.channel = grpc.insecure_channel("{}:{}".format(host, port))
+        self._call = self.channel.unary_unary(
+            "/preauth.Model/Score",
+            request_serializer=lambda b: b,
+            response_deserializer=lambda b: b)
+
+    def score(self, features: dict) -> float:
+        import grpc
+
+        try:
+            raw = self._call(json.dumps(features).encode(),
+                             timeout=self.timeout)
+            return float(json.loads(raw.decode())["score"])
+        except grpc.RpcError as exc:
+            # A DEADLINE is a distinct gRPC status, not a socket error. Mapping
+            # it onto the shared transport exception keeps the benchmark
+            # comparable -- but the status is preserved in the message, because
+            # "the deadline passed" and "the connection broke" are different
+            # incidents and a comparison that flattens them cannot say which
+            # transport failed how.
+            raise ModelTransportError(
+                "{}: {}".format(exc.code().name, exc.details())) from exc
+        except Exception as exc:                             # noqa: BLE001
+            raise ModelTransportError(str(exc)) from exc
+
+    def close(self) -> None:
+        self.channel.close()
