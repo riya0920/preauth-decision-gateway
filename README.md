@@ -465,6 +465,14 @@ exact failure Alertmanager was added to fix.
    that needs it. Failing open under $50 is a decision made in the dark.
 8. **A multi-day soak.** Thirty minutes bounds the leak rate and does not bound
    the leak; both growth curves it found are still growing.
-9. **WAL shipping and truncation.** `recover()` returns what a restart must
+9. ~~**WAL shipping and truncation.**~~ **DONE** — `gateway/shipping.py` ships
+   to a sink and reclaims disk by deleting whole segments, never by rewriting
+   the log. The watermark is made durable BEFORE the delete, and
+   `tests/test_shipping.py` executes the *wrong* order and measures the data
+   loss rather than asserting the right one works. `run_shipping.py`: 4,800
+   decisions through a sink that goes down for three cycles — disk climbs 53.8 →
+   161.2 KB then collapses to zero, and every decision is accounted for.
+   See `docs/SHIPPING.md`. Superseded note: `recover()` returns what a restart
+   must
    re-ship; nothing ships it and nothing truncates the WAL once records are
    acknowledged.
