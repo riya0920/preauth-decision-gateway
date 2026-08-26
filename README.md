@@ -432,7 +432,11 @@ exact failure Alertmanager was added to fix.
 
 ## What is NOT built
 
-1. **Alertmanager.** Rules fire and nothing routes, deduplicates, silences or
+1. ~~**Alertmanager.**~~ **DONE** — `ops/alertmanager.yml` routes page→oncall
+   (4h repeat) and ticket→queue (24h), groups on alertname+severity, and carries
+   three inhibition rules so a dead exporter does not also page for every metric
+   it stopped reporting. Superseded note: Rules fire and nothing routes,
+   deduplicates, silences or
    pages. A firing rule with nowhere to go is a red row on a page nobody has
    open, and that is most of the value of alerting.
 2. ~~**Grafana.**~~ **DONE** — `run_grafana_drill.py` renders
@@ -480,7 +484,12 @@ exact failure Alertmanager was added to fix.
    proper open-loop generator and `offered` tracks `target` exactly, so the
    harness is not the bottleneck. It finds no knee up to 800 RPS, and that is a
    fact about the *stub*: a sleeping model releases the GIL, so nothing contends.
-7. **The velocity-store-down posture is still unresolved.** With no counter the
+7. ~~**The velocity-store-down posture is still unresolved.**~~ **DONE** —
+   `gateway/velocity_policy.py` decides it. Fail-open always leaves the system
+   blind exactly when someone is hammering it; fail-closed always turns a
+   dependency outage into a total outage. The dial is EXPOSURE: below a value
+   ceiling, approve blind and MARK it (`velocity_seen=False`); above, decline.
+   Superseded note: With no counter the
    gateway cannot see a carding attack, and burst traffic is exactly the pattern
    that needs it. Failing open under $50 is a decision made in the dark.
 8. **A multi-day soak.** Thirty minutes bounds the leak rate and does not bound
