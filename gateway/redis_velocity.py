@@ -121,18 +121,25 @@ class NaiveRedisVelocity:
     that has never produced a wrong answer is not evidence of anything.
     """
 
-    def __init__(self, client, window_ms: int = 60_000, namespace: str = "naive"):
+    def __init__(self, client, window_ms: int = 60_000, namespace: str = "naive",
+                 on_race=None):
         self.client = client
         self.window_ms = window_ms
         self.namespace = namespace
         self._seq = 0
+        # Called in the read->write gap. None in production (this class exists
+        # only for the negative-control test); the test injects a barrier so
+        # every worker reads before any writes -- making the lost update
+        # deterministic instead of dependent on the runner's thread scheduling.
+        self.on_race = on_race
 
     def incr_and_count(self, key: str, now_ms: int) -> int:
         k = "{}:{}".format(self.namespace, key)
         self.client.zremrangebyscore(k, "-inf", now_ms - self.window_ms)
         current = self.client.zcard(k)              # READ
         self._seq += 1
-        # ... another instance can interleave here ...
+        if self.on_race is not None:
+            self.on_race()                          # force the interleave here
         self.client.zadd(k, {"{}-{}".format(now_ms, self._seq): now_ms})
         return current + 1                          # stale read + 1
 

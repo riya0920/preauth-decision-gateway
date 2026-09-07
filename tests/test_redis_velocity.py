@@ -48,29 +48,45 @@ def test_lua_counter_is_exact_under_50_workers(client):
 
 
 def test_naive_read_modify_write_is_demonstrably_wrong(client):
-    """If this ever returns the exact count, the test above proves nothing."""
-    naive = NaiveRedisVelocity(client, window_ms=10_000_000)
+    """A correct counter hands out 1..TOTAL exactly once. The naive
+    read-modify-write hands the SAME number to several workers, because they all
+    read the count before any of them writes back -- the lost update.
+
+    The read->write interleave is forced with a barrier rather than left to the
+    runner's thread scheduling. The earlier version asserted max(results) <
+    true_total, which held only when the OS happened to interleave the threads;
+    on a fast or serialised runner the race did not occur and this negative
+    control silently passed when it should have failed. Forcing every worker to
+    read before any writes makes the duplicate deterministic on any runner.
+    """
+    read_barrier = threading.Barrier(WORKERS, timeout=30)
+    naive = NaiveRedisVelocity(client, window_ms=10_000_000,
+                               on_race=read_barrier.wait)
     results = []
+    lock = threading.Lock()
 
-    def worker(barrier):
-        barrier.wait()
+    def worker(start):
+        start.wait()
+        local = []
         for i in range(PER_WORKER):
-            results.append(naive.incr_and_count("card:HOT", 1_000_000 + i))
+            local.append(naive.incr_and_count("card:HOT", 1_000_000 + i))
+        with lock:
+            results.extend(local)
 
-    barrier = threading.Barrier(WORKERS)
-    threads = [threading.Thread(target=worker, args=(barrier,))
+    start = threading.Barrier(WORKERS)
+    threads = [threading.Thread(target=worker, args=(start,))
                for _ in range(WORKERS)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
-    # The returned counts come from a stale read, so the maximum reported value
-    # undershoots the true total that actually landed in the set.
-    true_total = client.zcard("naive:card:HOT")
-    assert max(results) < true_total, (
-        "the racy counter reported the true total ({} vs {}) -- this test is "
-        "not exercising a race and cannot be trusted".format(max(results), true_total))
+    # A correct counter would return every value exactly once; repeated values
+    # are the fingerprint of the lost update, and cannot appear without a race.
+    assert len(results) == TOTAL
+    assert len(set(results)) < TOTAL, (
+        "every returned count was distinct -- the naive counter did not race, "
+        "so this negative control proves nothing")
 
 
 def test_same_millisecond_events_do_not_collapse(client):
