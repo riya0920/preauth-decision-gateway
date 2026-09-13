@@ -1,4 +1,4 @@
-# SE-3 — the velocity budget, revised from measurement
+# SE-3: the velocity budget, revised from measurement
 
 `gateway/redis_velocity.connect()` ended with an uncomfortable
 conclusion: at a p50 of ~18ms and a max near 1.8s, **Redis does not
@@ -8,7 +8,7 @@ cross-VM one. That was left as an open question. This answers it.
 
 ## 1. Co-location answers it
 
-The same Lua script, same Redis, same window — run from a process on
+The same Lua script, same Redis, same window: run from a process on
 the same host as the server instead of across the VM boundary.
 
 | | cross-VM | co-located | ratio |
@@ -25,13 +25,13 @@ Full co-located distribution (recorded 2026-08-24, n=5,000):
 
 **The whole distribution, including the p999, fits inside the 20ms
 allocation.** So the budget does not need rewriting for the healthy
-path — the deployment does. That is a different remediation from the
+path; the deployment does. That is a different remediation from the
 one the earlier comment was heading toward, and a cheaper one.
 
 ## 2. A hypothesis this refuted
 
-The expectation was that a velocity window under attack — which is
-exactly when the sorted set is largest — would be slower to evaluate,
+The expectation was that a velocity window under attack, which is
+exactly when the sorted set is largest, would be slower to evaluate,
 since `ZREMRANGEBYSCORE` is O(log N + M). It is not:
 
 | members in the window | p50 |
@@ -43,7 +43,7 @@ since `ZREMRANGEBYSCORE` is O(log N + M). It is not:
 
 A key holding 5,400 members measures the same as one holding 410. At
 these sizes the sorted-set operations are dominated by scheduler noise,
-and the tail belongs to the round trip rather than to Redis's work — a
+and the tail belongs to the round trip rather than to Redis's work: a
 bare `PING` measures p99 **6.31ms**, HIGHER than the script's
 **4.95ms**. Tuning the script would move nothing.
 
@@ -70,7 +70,7 @@ failure slower.** 15ms took 4,061ms where 1.0s took 3,234ms.
 
 The mechanism is that `redis-py` 8.x defaults every connection to
 `Retry(ExponentialWithJitterBackoff(), retries=10)` for
-`ConnectionError`, and that policy — not the socket timeout — governs
+`ConnectionError`, and that policy, not the socket timeout, governs
 how long a dead server takes to fail. A shorter timeout lets more of
 the ten attempts complete inside the same wall clock while the backoff
 accumulates. `retry_on_timeout=False` was already set in this
@@ -78,15 +78,15 @@ codebase in the belief that it disabled retrying. It does not; it is a
 separate flag.
 
 And the timeout is irrelevant to a refused connection anyway. The RST
-arrives in half a millisecond — the raw TCP row proves it — so with
+arrives in half a millisecond, the raw TCP row proves it, so with
 retries off the client fails at the speed of TCP, **0.4ms**.
 
 ### Two failure modes, two controls
 
 | | bounded by | measured |
 |---|---|---|
-| **connection refused** — Redis is down | the retry policy. The socket timeout does nothing. | 3,234ms → 0.4ms with `retries=0` |
-| **accepts but stalls** — GC pause, saturated box, network black hole | `socket_timeout`, and only it. | 1,003ms at 1.0s → 16ms at 15ms |
+| **connection refused**: Redis is down | the retry policy. The socket timeout does nothing. | 3,234ms → 0.4ms with `retries=0` |
+| **accepts but stalls**: GC pause, saturated box, network black hole | `socket_timeout`, and only it. | 1,003ms at 1.0s → 16ms at 15ms |
 
 Conflating them is what the earlier advice did. Both settings are
 needed and they defend against different things.
@@ -121,7 +121,7 @@ constraint attached to it:
 
 `RedisVelocity` raises rather than returning zero, because a zero
 "would report every card as quiet at exactly the moment the system
-went blind". Right, and only half the problem — raising moves the
+went blind". Right, and only half the problem: raising moves the
 decision up a level without making it. Nothing above it answered
 *Redis is down, this authorisation is in flight, do we approve it?*
 
@@ -129,7 +129,7 @@ decision up a level without making it. Nothing above it answered
 the two obvious ones:
 
 - **Fail open always** leaves the system blind precisely when someone
-  is hammering it — an overloaded velocity store is what a carding
+  is hammering it: an overloaded velocity store is what a carding
   attack produces, so an attacker who can knock over Redis has turned
   the fraud control off.
 - **Fail closed always** turns a dependency outage into a total
@@ -144,7 +144,7 @@ argument rather than a constant in a branch.
 Three things that matter more than the ceiling:
 
 - **Every blind approval carries `velocity_seen=False`.** Without it
-  the post-incident question — *which approvals went out blind?* — has
+  the post-incident question, *which approvals went out blind?*, has
   no answer, and fraud arriving three days later cannot be attributed
   to the outage that caused it.
 - **The failure path is timed too.** A stage that only measures its

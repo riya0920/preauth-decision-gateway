@@ -1,4 +1,4 @@
-# SE-3 — Low-Latency Pre-Auth Decision Gateway
+# SE-3: Low-Latency Pre-Auth Decision Gateway
 
 **Status: ~98%.** Latency budget, race-free velocity counters (in-process
 **and on Redis with an atomic Lua script**), tiered degradation, chaos drills,
@@ -55,12 +55,12 @@ between the p99 you promise and the p99 you measure.
 The 50-worker exactness proof (`tests/test_velocity.py`): 50 threads × 200
 increments on one hot key must land on exactly 10,000.
 
-The repo also ships `UnsafeCounter` — a read-modify-write with no lock — and a
+The repo also ships `UnsafeCounter`, a read-modify-write with no lock, and a
 test asserting it **loses** increments. A concurrency test that has never seen a
 wrong answer proves nothing, so the racy implementation stays as the control.
 This failure mode is worth naming precisely: a lost increment makes the counter
 merely *low*, never wrong-looking, and the traffic that triggers it is parallel
-burst traffic — which is exactly what a carding attack looks like. The bug is
+burst traffic, which is exactly what a carding attack looks like. The bug is
 aligned with the attack.
 
 Sliding window, not fixed bucket: 10 transactions at 11:59:59 and 10 at 12:00:01
@@ -70,11 +70,11 @@ must trip a "20 per minute" rule, and there's a test for it.
 
 | Amount | Model down | Why |
 |---|---|---|
-| < $50 | **fail open** — approve | Fraud loss on a $50 auth is ~$50; expected loss per approval at this tier is under a dollar, and a declined checkout costs more |
+| < $50 | **fail open**: approve | Fraud loss on a $50 auth is ~$50; expected loss per approval at this tier is under a dollar, and a declined checkout costs more |
 | $50–$500 | **rules only** | Blocklist and velocity still bite with no model; loss bounded, approval rate preserved |
-| > $500 | **fail closed** — review | Expected fraud loss now exceeds the cost of a review, so the amount buys the review |
+| > $500 | **fail closed**: review | Expected fraud loss now exceeds the cost of a review, so the amount buys the review |
 
-Engineering does not own these numbers — a fraud/risk policy owner does. That's
+Engineering does not own these numbers; a fraud/risk policy owner does. That's
 why they're a table the service reads, not constants in the decision function.
 
 ## Chaos drills
@@ -84,23 +84,23 @@ why they're a table the service reads, not constants in the decision function.
 | Model service killed mid-load | 1,200 requests, **0 non-decisions**; source flips to the three degradation tiers |
 | Velocity store down too | 800 requests, 0 non-decisions |
 | Both restored | 99.8% back on `model` (breaker half-opens, 2 probes on rules) |
-| Audit sink killed | p99 32.12ms vs 33.63ms steady — unchanged; 7,600 events buffered, **100% shipped** after recovery |
+| Audit sink killed | p99 32.12ms vs 33.63ms steady: unchanged; 7,600 events buffered, **100% shipped** after recovery |
 
 **p99 dropped from 33.63ms to 2.51ms when the model died, and that is bad news.**
 We were paying ~30ms for accuracy and stopped paying it. During this drill the
-graph to watch is approval rate and fraud rate, not latency — a latency
+graph to watch is approval rate and fraud rate, not latency: a latency
 improvement with no deploy behind it means something stopped happening.
 
 On async audit logging: what it costs is a crash between the buffer write and the
 drain. If compliance requires every decision durably logged *before* responding,
-the answer is a local WAL append plus async shipping — not a synchronous write to
+the answer is a local WAL append plus async shipping, not a synchronous write to
 a remote sink, and not wishing the requirement away.
 
 ## A bug this build caught
 
 The first version simulated the model call with a **busy-wait**, which holds the
 GIL. Eight worker threads spinning starved each other, and the budget table
-reported a **125ms p99 on the velocity stage** — a stage that is a mutex and a
+reported a **125ms p99 on the velocity stage**, a stage that is a mutex and a
 deque append and cannot take 125ms. The table was measuring GIL contention, not
 stage cost. A model call is I/O, so it now sleeps and releases the GIL; velocity
 reads 0.04ms. Any load harness where the fake dependency burns CPU is measuring
@@ -120,11 +120,11 @@ counter that cannot see the attack that started 90 seconds ago. So freshness is
 | `velocity_24h` | HARD | 30s | cannot see an in-progress attack when stale |
 | `device_history` | SOFT | 300s | changes slowly; stale is still informative |
 | `card_tenure_days` | SOFT | 3600s | changes once a day at most |
-| `merchant_risk` | STATIC | — | reference data, versioned not cached |
+| `merchant_risk` | STATIC | N/A | reference data, versioned not cached |
 
 A stale SOFT feature still scores, at a **tightened threshold** (0.75 − 0.05 per
 stale feature). A stale HARD feature is treated as **missing** and the request
-falls back to rules — scoring on a two-minute-old velocity counter is worse than
+falls back to rules: scoring on a two-minute-old velocity counter is worse than
 knowing you do not have it. Chaos drill 3 exercises all three states live:
 
 ```
@@ -139,7 +139,7 @@ feature cache DOWN            degraded_*_no_features 94.0%
 Prometheus text format, hand-written rather than pulled from `prometheus_client`
 because the exposition format is twelve lines and the dependency would obscure
 the point: **histograms, not averages.** 99 requests at 5ms and one at 2000ms
-average under 25ms and blow a 100ms p99 SLO — a mean hides the tail by
+average under 25ms and blow a 100ms p99 SLO: a mean hides the tail by
 construction. Bucket boundaries cluster around the budget (5–100ms) rather than
 being log-spaced by habit, so the quantile estimate is precise where the SLO
 lives. Per-stage histograms are exported alongside the end-to-end one, because an
@@ -147,7 +147,7 @@ SLO breach that does not say which stage moved is an alert nobody can act on.
 
 ## The 30-minute soak, actually run
 
-`python run_soak.py --soak-seconds 1800` — 180,053 requests over four segments:
+`python run_soak.py --soak-seconds 1800`: 180,053 requests over four segments:
 
 ```
    segment  requests       p50       p99
@@ -160,7 +160,7 @@ velocity keys  before -> after  : 0 -> 4,001
 audit buffer   before -> after  : 0 -> 180,053  (never drained)
 ```
 
-**Established:** p99 did not degrade — it drifted **down** 37%, which is warm-up
+**Established:** p99 did not degrade; it drifted **down** 37%, which is warm-up
 amortising over more samples rather than good news. And two growth curves are
 real and unbounded: velocity keys (the in-process store trims *within* a window
 and never evicts the key; the Redis version sets a TTL) and the audit buffer.
@@ -171,7 +171,7 @@ nothing here has run for one.
 
 ## Audit durability: the WAL
 
-The drill established that async audit logging is nearly free on the hot path —
+The drill established that async audit logging is nearly free on the hot path:
 p99 32.12ms with the sink dead against 33.63ms steady. It also established, *in
 words while the code did nothing about it*, what that buffering costs: a crash
 between the buffer write and the drain loses those records.
@@ -188,7 +188,7 @@ appends:
 | always | 1.720 ms | 4.148 ms | 4,000 |
 
 `never` and `batch` are genuinely free against a 100ms budget. **`always` is
-not** — 4.1% of the whole budget spent on one fsync per decision, on an idle
+not**: 4.1% of the whole budget spent on one fsync per decision, on an idle
 laptop SSD with no competing write load. `never` survives a process crash,
 `always` survives a machine crash, `batch` bounds the loss to a configurable
 window, and that choice belongs to whoever owns the compliance requirement.
@@ -207,7 +207,7 @@ customer's money with no record that it made it, and an adverse-action request
 against any of them has no answer.
 
 The WAL is **wired into `serve.py`**, not offered as a library. A durability
-mechanism that exists beside the thing making decisions protects nothing —
+mechanism that exists beside the thing making decisions protects nothing;
 "available" and "enforced" are different claims. What it does *not* do is replace
 shipping: a disk that dies takes it too. It bounds loss to what has not yet
 shipped.
@@ -215,7 +215,7 @@ shipped.
 ## Alert rules and a dashboard that cannot drift
 
 `ops/alerts.yml` (10 rules) and `ops/dashboard.json` (7 panels). **Nothing
-scrapes them** — there is no Prometheus and no Grafana here — which is exactly
+scrapes them**: there is no Prometheus and no Grafana here, which is exactly
 why they need a test. A rule naming a metric nobody emits never fires, and an
 alert that never fires looks identical to a system that is never unhealthy.
 
@@ -223,13 +223,13 @@ alert that never fires looks identical to a system that is never unhealthy.
 and asserts every metric named by every rule and every panel is actually
 exported. **It found the drift immediately:** the first draft used `preauth_*`
 names throughout and the exporter emits `gateway_*`. It also found three metrics
-the rules needed and nothing emitted — audit buffer depth, unshipped WAL depth,
-and velocity errors — which is why the registry now has **gauges** at all. A
+the rules needed and nothing emitted: audit buffer depth, unshipped WAL depth,
+and velocity errors, which is why the registry now has **gauges** at all. A
 counter cannot express a buffer that drains: it keeps climbing and says nothing
 about the current depth, which is the only number an operator can act on.
 
 The rules encode one principle: **page on symptoms the customer feels, ticket on
-causes.** The model service being down is a *ticket* — the gateway degrades by
+causes.** The model service being down is a *ticket*: the gateway degrades by
 design, and waking someone for a dependency the design already survives is how a
 rota stops reading its alerts. What *pages* is the approval rate moving 5 points
 against the same time yesterday, whatever the cause turns out to be.
@@ -238,7 +238,7 @@ Two rules are worth calling out. `PreauthLatencyImprovedSuspiciously` fires
 because a graph got **better**: killing the model took p99 from 33.63ms to
 2.51ms, and a latency improvement with no deploy behind it means something
 stopped happening. `PreauthNoTraffic` exists because a gateway with no traffic
-and a gateway that is down look identical on every other panel — which is also
+and a gateway that is down look identical on every other panel, which is also
 why the dashboard's **first** panel is request rate rather than latency, and a
 test asserts that ordering.
 
@@ -247,7 +247,7 @@ test asserts that ordering.
 `run_redis_real.py` runs the velocity counter against **Redis 8.0.5**, 50 threads
 × 200 increments on one hot key.
 
-**The first run lost 2,400 of 10,000 increments** — and the *racy* control
+**The first run lost 2,400 of 10,000 increments**, and the *racy* control
 counter lost only 200. That inverted the claim I had just written, which was that
 the racy one would be "worse, and predictably so".
 
@@ -258,7 +258,7 @@ the **same** member, `ZADD` overwrote instead of adding, and the count came out
 silently low.
 
 **The critical section was atomic the entire time. The uniqueness the whole
-scheme depends on was generated by racy client code outside it** — which is a
+scheme depends on was generated by racy client code outside it**, which is a
 useful reminder that "the Lua is atomic" is a claim about the Lua and not about
 the call site. Fixed with `itertools.count` (a single C-level `next()`), and the
 counter is now exact at 10,000/10,000. `test_member_generation_is_thread_safe`
@@ -271,7 +271,7 @@ latency (ms) : mean 26.97   p50 17.68   p95 55.74   p99 142.22
 ```
 
 **The velocity stage budget is 20ms and the p99 is 142ms.** That is not Redis
-being slow — p50 is 17.7ms. It is 50 threads sharing one connection pool and
+being slow; p50 is 17.7ms. It is 50 threads sharing one connection pool and
 queueing for a connection, so most of the tail is time spent waiting to be
 allowed to talk to Redis at all. The in-process counter has no pool and therefore
 no queue.
@@ -281,7 +281,7 @@ dependency becoming a network service**, and the budget table earlier in this
 README was written against the in-process one.
 
 Third finding: pointed at a dead port, the counter **raises after ~2,000ms**
-rather than returning a wrong count. Raising is correct — a counter that returned
+rather than returning a wrong count. Raising is correct: a counter that returned
 0 would report every card as quiet at exactly the moment the system went blind.
 But 2,000ms is longer than the entire 20ms budget, so **failing takes longer than
 succeeding**, and the gateway needs a client timeout shorter than its own budget
@@ -291,7 +291,7 @@ rather than the library default.
 
 `tests/test_alert_rules.py` asserts every metric the rules name is exported.
 That catches drift and it does not answer the next question: **would these rules
-ever fire?** A rule can name real metrics and still be unfirable — PromQL that
+ever fire?** A rule can name real metrics and still be unfirable: PromQL that
 never evaluates true, a label that is not on the series, a `for` clause longer
 than any real incident.
 
@@ -313,13 +313,13 @@ BROKEN PromQL: 0
 ```
 
 **All ten rules evaluate cleanly and `PreauthNoTraffic` fired.** Not merely valid
-YAML, not merely valid PromQL — it evaluated true against real scraped series and
+YAML, not merely valid PromQL: it evaluated true against real scraped series and
 transitioned all the way to firing.
 
 It is the rule chosen deliberately, because it can be caused **honestly**: stop
 sending requests. Forcing a latency breach would mean rigging the gateway, and a
 rule proven by a rigged input is proven against the rig. Its `for: 5m` sits on
-top of a 5m rate window, so it took 288 seconds of real quiet — the drill waits
+top of a 5m rate window, so it took 288 seconds of real quiet: the drill waits
 rather than pretending.
 
 Running the container also settles a separate open item: **the image runs**, not
@@ -349,19 +349,19 @@ silently requires Redis to start is a service that will not start.
 `SafeCounter.Unavailable`, so a `RedisVelocity` failure escaped the handler and
 the request died with a **500 instead of falling back to rules**. The whole point
 of the stage is its degradation policy, and a gateway that 500s when its counter
-is down does not have a policy — it has a dependency.
+is down does not have a policy; it has a dependency.
 
 ### The timeout took three attempts, and the failures are the lesson
 
 | attempt | reasoning | result |
 |---|---|---|
-| 15 ms | "inside the 20ms budget" | **timed out healthy calls** — p50 is 17.7ms, so it sat below the dependency's own median |
-| 250 ms | "generous enough" | counter returned **88 of 10,000** — the measured max is ~1,800ms, so it discarded the tail |
+| 15 ms | "inside the 20ms budget" | **timed out healthy calls**: p50 is 17.7ms, so it sat below the dependency's own median |
+| 250 ms | "generous enough" | counter returned **88 of 10,000**: the measured max is ~1,800ms, so it discarded the tail |
 | **1.0 s** | set from the measured distribution | exact 10,000/10,000; dead-server failure drops from 2,039ms to **1,030ms** |
 
 **A timeout must sit above the healthy p99, not below the budget.** Setting it
 from the budget instead of from the measurement turns every slow-but-fine request
-into an outage — which is the first row of that table, and it is the version that
+into an outage, which is the first row of that table, and it is the version that
 looks most principled on paper.
 
 ### The conclusion I did not want
@@ -370,7 +370,7 @@ With a bounded pool and a sane timeout: **p50 23ms, p99 196ms, max 368ms**
 against a **20 ms** velocity allocation.
 
 **Redis does not fit this budget.** Not because Redis is slow, and not because
-the pool is wrong — the p50 alone exceeds the whole allocation over this
+the pool is wrong: the p50 alone exceeds the whole allocation over this
 transport. The budget table earlier in this README was written against an
 in-process counter, and adopting Redis means either rewriting the budget or
 co-locating Redis so the hop is a loopback rather than a cross-VM one. Keeping
@@ -380,7 +380,7 @@ number that is true of a system nobody is running.
 ### And one more: my "dead server" was alive
 
 The failure drill pointed at port 6399 and reported a clean `Unavailable` after
-2,039ms. Port 6399 turned out to be **open on this machine** — so the test that
+2,039ms. Port 6399 turned out to be **open on this machine**, so the test that
 proved the gateway handles a dead Redis was talking to a live one. Moved to a
 port verified closed, and the behaviour does hold: it raises rather than
 returning a wrong count, which is what lets the gateway tell "no attack" apart
@@ -389,7 +389,7 @@ from "cannot see".
 ## Alertmanager: rules now have somewhere to go
 
 Prometheus decides *when* a rule is true. Alertmanager decides *who finds out,
-how often, and when to stop* — and a firing rule with nowhere to go is a red row
+how often, and when to stop*, and a firing rule with nowhere to go is a red row
 on a page nobody has open, which was this project's largest remaining gap.
 
 `ops/alertmanager.yml` validates (`amtool check-config`: 3 inhibit rules, 2
@@ -412,12 +412,12 @@ description.** A page goes to a human at 03:00; a ticket goes to a queue.
 
 Three behaviours Prometheus cannot provide on its own:
 
-- **Grouping.** One incident trips several rules — a dying model fires
+- **Grouping.** One incident trips several rules: a dying model fires
   `PreauthModelServiceDown`, moves the approval rate, *and* drops the p99.
   Grouping on `alertname`+`severity` rather than `instance` makes that one
   notification instead of three.
 - **Inhibition.** When there is no traffic, "the model stage is over its
-  allocation" is noise — nothing can be slow when nothing is happening. So
+  allocation" is noise: nothing can be slow when nothing is happening. So
   `PreauthNoTraffic` suppresses the latency alerts, and a dead model suppresses
   the suspicious-improvement alert because **they are the same event**. Without
   those two rules an outage pages three times and buries the one alert that says
@@ -426,38 +426,38 @@ Three behaviours Prometheus cannot provide on its own:
   page that never comes back means a rota which misses one notification misses
   the incident.
 
-A test asserts every receiver named by a route actually exists — a route
+A test asserts every receiver named by a route actually exists: a route
 pointing at a missing receiver is an alert firing into nothing, which is the
 exact failure Alertmanager was added to fix.
 
 ## What is NOT built
 
-1. ~~**Alertmanager.**~~ **DONE** — `ops/alertmanager.yml` routes page→oncall
+1. ~~**Alertmanager.**~~ **DONE**: `ops/alertmanager.yml` routes page→oncall
    (4h repeat) and ticket→queue (24h), groups on alertname+severity, and carries
    three inhibition rules so a dead exporter does not also page for every metric
    it stopped reporting. Superseded note: Rules fire and nothing routes,
    deduplicates, silences or
    pages. A firing rule with nowhere to go is a red row on a page nobody has
    open, and that is most of the value of alerting.
-2. ~~**Grafana.**~~ **DONE** — `run_grafana_drill.py` renders
+2. ~~**Grafana.**~~ **DONE**: `run_grafana_drill.py` renders
    `ops/dashboard.json` in a real Grafana 11.3.1 against a real Prometheus
    scraping the real exporter, and queries every panel through Grafana's own
    datasource proxy. All 7 panels import, the datasource binds, and 12 of 13
    expressions return data. The 13th returns a series with zero points and is
    correct: it is the `offset 1d` comparison, and a Prometheus started minutes
    ago has no yesterday. See `docs/GRAFANA.md`.
-3. ~~**A velocity budget that matches the dependency.**~~ **DONE** — see
+3. ~~**A velocity budget that matches the dependency.**~~ **DONE**: see
    `docs/VELOCITY_BUDGET.md`. Co-located, the velocity check measures p50
    0.33ms / p99 4.95ms / p999 12.04ms, so the whole distribution fits the 20ms
    allocation. The budget stands; the deployment is the constraint.
-4. ~~**Co-located Redis.**~~ **DONE** — measured, and it answered the budget
+4. ~~**Co-located Redis.**~~ **DONE**: measured, and it answered the budget
    question exactly as suspected: 54x faster at the median than across the WSL
    NIC. The same run also found that `socket_timeout` does NOT bound a refused
-   connection — redis-py's retry policy does — and that tightening the timeout
+   connection; redis-py's retry policy does, and that tightening the timeout
    made failure *slower*.
 5. ~~**gRPC itself.**~~ **DONE, and it settled the argument the item made.**
-   Real gRPC is in the comparison — HTTP/2, deadlines, per-stream flow control,
-   status codes — with JSON payloads instead of protobuf, because
+   Real gRPC is in the comparison, HTTP/2, deadlines, per-stream flow control,
+   status codes, with JSON payloads instead of protobuf, because
    `grpcio-tools` will not build on this Python. That substitution makes the
    wire LARGER than real gRPC and leaves every mechanism the comparison is
    about intact.
@@ -467,24 +467,24 @@ exact failure Alertmanager was added to fix.
    80, http 53.** The claim holds.
 
    **But the more useful finding is a caveat on the latency columns.** binary's
-   p50 of 32ms at 32 threads is computed over the calls that SURVIVED — the 80
+   p50 of 32ms at 32 threads is computed over the calls that SURVIVED: the 80
    that timed out contribute nothing. gRPC's 257ms is over 384 completed calls.
    A transport that drops its slowest work always looks fast, and comparing
    percentiles across different error rates is survivorship bias with a table
    around it. What actually happened is the classic trade: gRPC queues behind
    flow control and everyone waits; the others drop and the survivors look
-   quick. For a pre-auth inside a 2s deadline a 260ms answer beats a timeout —
+   quick. For a pre-auth inside a 2s deadline a 260ms answer beats a timeout;
    on a stage with a 30ms budget it would not. Superseded note:
    `run_transports.py` runs a genuinely separate model PROCESS
    and compares pooled keep-alive HTTP against length-prefixed binary framing on
-   loopback. Binary is 2.07ms faster at p50 — and at 32 concurrent callers it
+   loopback. Binary is 2.07ms faster at p50, and at 32 concurrent callers it
    timed out **95 times against HTTP's 14**. It wins the microbenchmark and loses
    the failure mode, and that is the actual argument for gRPC.
 6. **A load curve that says anything about a REAL gateway.** `run_soak.py` is a
    proper open-loop generator and `offered` tracks `target` exactly, so the
    harness is not the bottleneck. It finds no knee up to 800 RPS, and that is a
    fact about the *stub*: a sleeping model releases the GIL, so nothing contends.
-7. ~~**The velocity-store-down posture is still unresolved.**~~ **DONE** —
+7. ~~**The velocity-store-down posture is still unresolved.**~~ **DONE**:
    `gateway/velocity_policy.py` decides it. Fail-open always leaves the system
    blind exactly when someone is hammering it; fail-closed always turns a
    dependency outage into a total outage. The dial is EXPOSURE: below a value
@@ -494,12 +494,12 @@ exact failure Alertmanager was added to fix.
    that needs it. Failing open under $50 is a decision made in the dark.
 8. **A multi-day soak.** Thirty minutes bounds the leak rate and does not bound
    the leak; both growth curves it found are still growing.
-9. ~~**WAL shipping and truncation.**~~ **DONE** — `gateway/shipping.py` ships
+9. ~~**WAL shipping and truncation.**~~ **DONE**: `gateway/shipping.py` ships
    to a sink and reclaims disk by deleting whole segments, never by rewriting
    the log. The watermark is made durable BEFORE the delete, and
    `tests/test_shipping.py` executes the *wrong* order and measures the data
    loss rather than asserting the right one works. `run_shipping.py`: 4,800
-   decisions through a sink that goes down for three cycles — disk climbs 53.8 →
+   decisions through a sink that goes down for three cycles: disk climbs 53.8 →
    161.2 KB then collapses to zero, and every decision is accounted for.
    See `docs/SHIPPING.md`. Superseded note: `recover()` returns what a restart
    must
